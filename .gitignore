@@ -26,3 +26,5 @@ venv/
 .env.*
 # Tool cache
 .cache/
+# ignore local caches
+.cache
