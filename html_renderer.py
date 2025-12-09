@@ -1,6 +1,7 @@
 # html_renderer.py
 from __future__ import annotations
 from typing import Dict
+import html
 
 
 def render_html(data: Dict) -> str:
@@ -9,15 +10,28 @@ def render_html(data: Dict) -> str:
 
     rows = []
     for t in tracks:
-        links = t["links"]
+        links = t.get("links") or {}
+        beat = links.get("beatport") or ""
+        band = links.get("bandcamp") or ""
+        itunes = links.get("itunes") or ""
+
+        title = html.escape(str(t.get('title') or ''))
+        artist = html.escape(str(t.get('artist') or ''))
+        album = html.escape(str(t.get('album') or ''))
+
+        def link_cell(url: str, label: str) -> str:
+            if not url:
+                return ""
+            return f'<a href="{html.escape(url)}" target="_blank">{label}</a>'
+
         row = f"""
         <tr>
-          <td>{t['title']}</td>
-          <td>{t['artist']}</td>
-          <td>{t['album']}</td>
-          <td><a href="{links['beatport']}" target="_blank">Beatport</a></td>
-          <td><a href="{links['bandcamp']}" target="_blank">Bandcamp</a></td>
-          <td><a href="{links['itunes']}" target="_blank">iTunes</a></td>
+          <td>{title}</td>
+          <td>{artist}</td>
+          <td>{album}</td>
+          <td>{link_cell(beat, 'Beatport')}</td>
+          <td>{link_cell(band, 'Bandcamp')}</td>
+          <td>{link_cell(itunes, 'iTunes')}</td>
         </tr>
         """
         rows.append(row)
