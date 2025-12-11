@@ -973,21 +973,11 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
             tracks = results.get("tracks", {}).get("items", [])
             
             if tracks:
-                # Use first match to enrich metadata
+                # Use first match to enrich ISRC only (preserve Apple's original artist/album)
                 sp_track = tracks[0]
                 print(f"Debug: Found match: {sp_track.get('name')} by {[a.get('name') for a in sp_track.get('artists', [])]}")
                 
-                # Update artist info
-                sp_artists = sp_track.get("artists", [])
-                if sp_artists:
-                    track["artists"] = [{"name": a.get("name", "")} for a in sp_artists]
-                
-                # Update album info
-                album = sp_track.get("album", {})
-                if album:
-                    track["album"] = {"name": album.get("name", "")}
-                
-                # Add ISRC if available (only ISRC, don't add Spotify URL for Apple playlists)
+                # Add ISRC if available (only ISRC, keep Apple's original artist/album/URLs)
                 isrc = sp_track.get("external_ids", {}).get("isrc")
                 if isrc:
                     if "external_ids" not in track:
