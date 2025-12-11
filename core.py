@@ -662,9 +662,20 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
             if a_el and a_el.get_text(strip=True):
                 artist = a_el.get_text(strip=True)
             else:
+                # Fallback 1: split by –（em dash）
                 parts = text.split("–")
                 if len(parts) >= 2:
                     artist = parts[1].strip()
+                # Fallback 2: split by - (hyphen) if em dash didn't work
+                if not artist:
+                    parts = text.split("-")
+                    if len(parts) >= 2:
+                        artist = parts[1].strip()
+                # Fallback 3: split by • (bullet) if hyphen didn't work
+                if not artist:
+                    parts = text.split("•")
+                    if len(parts) >= 2:
+                        artist = parts[1].strip()
 
             # album (optional)
             album = ""
@@ -801,8 +812,9 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     try:
         sp = get_spotify_client()
-    except Exception:
-        # If Spotify client unavailable, return as-is
+    except Exception as e:
+        # If Spotify client unavailable, log and return as-is
+        print(f"Warning: Spotify client unavailable for enrichment: {e}")
         return result
     
     items = result.get("items", [])
@@ -810,26 +822,34 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     
     for item in items:
         track = item.get("track", {})
-        title = track.get("name", "")
+        title = track.get("name", "").strip()
         artists = track.get("artists", [])
-        artist_name = artists[0].get("name", "") if artists else ""
+        artist_name = artists[0].get("name", "").strip() if artists else ""
         
-        if not title or not artist_name:
-            # Can't search without title and artist
+        if not title:
+            # Can't search without title
+            enriched_items.append(item)
+            continue
+        
+        # If artist is missing, try to enrich with Spotify search anyway
+        if not artist_name:
+            print(f"Debug: Apple track has no artist: {title}")
             enriched_items.append(item)
             continue
         
         # Search Spotify for this track
         try:
             query = f"track:{title} artist:{artist_name}"
-            results = sp.search(q=query, type="track", limit=1)
+            print(f"Debug: Searching Spotify for: {query}")
+            results = sp.search(q=query, type="track", limit=3)
             tracks = results.get("tracks", {}).get("items", [])
             
             if tracks:
                 # Use first match to enrich metadata
                 sp_track = tracks[0]
+                print(f"Debug: Found match: {sp_track.get('name')} by {[a.get('name') for a in sp_track.get('artists', [])]}")
                 
-                # Update artist info if better
+                # Update artist info
                 sp_artists = sp_track.get("artists", [])
                 if sp_artists:
                     track["artists"] = [{"name": a.get("name", "")} for a in sp_artists]
@@ -844,13 +864,15 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
                 if sp_external_ids.get("isrc"):
                     track["external_ids"] = {"isrc": sp_external_ids.get("isrc")}
                 
-                # Add Spotify URL if available
+                # Preserve Apple URL, add Spotify URL
                 sp_url = sp_track.get("external_urls", {}).get("spotify")
                 if sp_url:
                     track["external_urls"] = {
                         "spotify": sp_url,
                         "apple": track.get("external_urls", {}).get("apple", "")
                     }
+            else:
+                print(f"Debug: No Spotify match for: {query}")
         except Exception as e:
             # On search error, keep original track data
             print(f"Warning: Failed to enrich track '{title}' with Spotify data: {e}")
