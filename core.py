@@ -345,7 +345,12 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    playlist_url = playlist.get("external_urls", {}).get("spotify", "")
+    # Prefer Spotify URL; if missing (e.g., Apple playlist), fall back to Apple URL
+    playlist_url = (
+        playlist.get("external_urls", {}).get("spotify")
+        or playlist.get("external_urls", {}).get("apple")
+        or ""
+    )
 
     tracks_out: List[Dict[str, Any]] = []
 
@@ -913,10 +918,12 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
                 if album:
                     track["album"] = {"name": album.get("name", "")}
                 
-                # Add BPM (tempo) if available
-                tempo = sp_track.get("tempo")
-                if tempo:
-                    track["bpm"] = round(tempo)  # Round to nearest integer
+                # Add ISRC if available
+                isrc = sp_track.get("external_ids", {}).get("isrc")
+                if isrc:
+                    if "external_ids" not in track:
+                        track["external_ids"] = {}
+                    track["external_ids"]["isrc"] = isrc
                 
                 # Preserve Apple URL, add Spotify URL
                 sp_url = sp_track.get("external_urls", {}).get("spotify")
