@@ -534,7 +534,7 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
         rows = soup.find_all(attrs={'role': 'row'})
         if rows:
             # Skip header row (first row)
-                for row in rows[1:]:
+            for row in rows[1:]:
                 # Use pipe separator to split into cells, then clean up
                 text = row.get_text(separator='|')
                 parts = [p.strip() for p in text.split('|') if p.strip()]
@@ -633,7 +633,9 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                 items.append({"track": track})
     except Exception as e:
         # If Playwright is not available or rendering fails, raise error
-        raise RuntimeError(f"Failed to fetch Apple Music playlist with Playwright: {e}")    playlist = {"id": url, "name": playlist_name, "external_urls": {"apple": url}}
+        raise RuntimeError(f"Failed to fetch Apple Music playlist with Playwright: {e}")
+    
+    playlist = {"id": url, "name": playlist_name, "external_urls": {"apple": url}}
 
     result = {"playlist": playlist, "items": items}
 
