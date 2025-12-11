@@ -987,20 +987,12 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
                 if album:
                     track["album"] = {"name": album.get("name", "")}
                 
-                # Add ISRC if available
+                # Add ISRC if available (only ISRC, don't add Spotify URL for Apple playlists)
                 isrc = sp_track.get("external_ids", {}).get("isrc")
                 if isrc:
                     if "external_ids" not in track:
                         track["external_ids"] = {}
                     track["external_ids"]["isrc"] = isrc
-                
-                # Preserve Apple URL, add Spotify URL
-                sp_url = sp_track.get("external_urls", {}).get("spotify")
-                if sp_url:
-                    track["external_urls"] = {
-                        "spotify": sp_url,
-                        "apple": track.get("external_urls", {}).get("apple", "")
-                    }
             else:
                 print(f"Debug: No Spotify match for: {query}")
         except Exception as e:
