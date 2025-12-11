@@ -494,7 +494,8 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
 
     items = []
 
-    # If JSON-LD contains track information, prefer that
+    # If JSON-LD contains track information, use it but mark as incomplete if missing artist/album
+    ld_items_has_artist_album = False
     if ld and isinstance(ld, dict) and ld.get("track"):
         tracks_ld = ld.get("track") or []
         for t in tracks_ld:
@@ -518,6 +519,8 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                 "external_ids": {"isrc": isrc},
             }
             items.append({"track": track})
+            if artist or album:
+                ld_items_has_artist_album = True
 
     # If JSON-LD not helpful, try to extract embedded JSON blobs from scripts
     def _extract_tracks_from_jsonobj(obj: Any) -> List[dict]:
@@ -699,67 +702,120 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
             items.append({"track": track})
 
     # If still no items, try Playwright-based rendering as a fallback
-    if not items:
+    # OR if JSON-LD items don't have artist/album info, try to enrich them with Playwright
+    if not items or not ld_items_has_artist_album:
         try:
             html2 = _fetch_with_playwright(url)
             soup2 = BeautifulSoup(html2, "html.parser")
-            # Attempt same heuristics on rendered HTML
-            candidates = []
-            candidates.extend(soup2.select("ol li"))
-            candidates.extend(soup2.select("ul li"))
-            candidates.extend(soup2.select("div[role='listitem']"))
-            candidates.extend(soup2.select("div.songs-list-row"))
-
-            seen = set()
-            for row in candidates:
-                text = row.get_text(" ", strip=True)
-                if not text or text in seen:
-                    continue
-                seen.add(text)
-
-                title = ""
-                t_el = row.select_one("h3") or row.select_one("[data-test-song-title]") or row.select_one(".songs-list-row__song-title")
-                if t_el and t_el.get_text(strip=True):
-                    title = t_el.get_text(strip=True)
+            
+            # Try role="row" selector from Apple Music table layout
+            rows = soup2.find_all(attrs={'role': 'row'})
+            pw_items = []
+            if rows:
+                # Skip header row (first row)
+                for row in rows[1:]:
+                    # Use pipe separator to split into cells, then clean up
+                    text = row.get_text(separator='|')
+                    parts = [p.strip() for p in text.split('|') if p.strip()]
+                    
+                    if len(parts) >= 5:
+                        # Format: [song, artist, rank?, artist_dup, album, preview(?), time]
+                        # Pick fields by position
+                        title = parts[0] if len(parts) > 0 else ""
+                        artist = parts[1] if len(parts) > 1 else ""
+                        # Album should be at index 4 or later, but skip preview/time
+                        album = ""
+                        for idx in range(4, len(parts)):
+                            candidate = parts[idx]
+                            # Skip "プレビュー", "preview" and time format
+                            if candidate and candidate not in ("プレビュー", "preview"):
+                                if not (":" in candidate and candidate.count(":") == 1):
+                                    album = candidate
+                                    break
+                        
+                        apple_track_url = ""
+                        a_tag = row.find("a", href=True)
+                        if a_tag and "music.apple.com" in a_tag["href"]:
+                            apple_track_url = a_tag["href"]
+                        
+                        isrc = None
+                        
+                        track = {
+                            "name": title,
+                            "artists": [{"name": artist}] if artist else [],
+                            "album": {"name": album},
+                            "external_urls": {"apple": apple_track_url},
+                            "external_ids": {"isrc": isrc},
+                        }
+                        
+                        pw_items.append({"track": track})
+            
+            # If Playwright found items, use them (especially if JSON-LD lacked artist/album)
+            if pw_items:
+                if not ld_items_has_artist_album:
+                    # JSON-LD was incomplete, replace with Playwright items
+                    items = pw_items
                 else:
-                    b = row.select_one("strong") or row.select_one("b")
-                    if b and b.get_text(strip=True):
-                        title = b.get_text(strip=True)
+                    # JSON-LD was complete, use it as is
+                    pass
+            elif not items:
+                # Fallback: attempt old heuristics on rendered HTML if role=row didn't work
+                candidates = []
+                candidates.extend(soup2.select("ol li"))
+                candidates.extend(soup2.select("ul li"))
+                candidates.extend(soup2.select("div[role='listitem']"))
+                candidates.extend(soup2.select("div.songs-list-row"))
+
+                seen = set()
+                for row in candidates:
+                    text = row.get_text(" ", strip=True)
+                    if not text or text in seen:
+                        continue
+                    seen.add(text)
+
+                    title = ""
+                    t_el = row.select_one("h3") or row.select_one("[data-test-song-title]") or row.select_one(".songs-list-row__song-title")
+                    if t_el and t_el.get_text(strip=True):
+                        title = t_el.get_text(strip=True)
                     else:
-                        title = text.split("—")[0].strip()
+                        b = row.select_one("strong") or row.select_one("b")
+                        if b and b.get_text(strip=True):
+                            title = b.get_text(strip=True)
+                        else:
+                            title = text.split("—")[0].strip()
 
-                artist = ""
-                a_el = row.select_one(".songs-list-row__by-line") or row.select_one("[data-test-artist-name]") or row.select_one(".byline")
-                if a_el and a_el.get_text(strip=True):
-                    artist = a_el.get_text(strip=True)
-                else:
-                    parts = text.split("–")
-                    if len(parts) >= 2:
-                        artist = parts[1].strip()
+                    artist = ""
+                    a_el = row.select_one(".songs-list-row__by-line") or row.select_one("[data-test-artist-name]") or row.select_one(".byline")
+                    if a_el and a_el.get_text(strip=True):
+                        artist = a_el.get_text(strip=True)
+                    else:
+                        parts = text.split("–")
+                        if len(parts) >= 2:
+                            artist = parts[1].strip()
 
-                album = ""
-                album_el = row.select_one(".songs-list-row__collection") or row.select_one("[data-test-album-name]")
-                if album_el and album_el.get_text(strip=True):
-                    album = album_el.get_text(strip=True)
+                    album = ""
+                    album_el = row.select_one(".songs-list-row__collection") or row.select_one("[data-test-album-name]")
+                    if album_el and album_el.get_text(strip=True):
+                        album = album_el.get_text(strip=True)
 
-                apple_track_url = ""
-                a_tag = row.find("a", href=True)
-                if a_tag and "music.apple.com" in a_tag["href"]:
-                    apple_track_url = a_tag["href"]
+                    apple_track_url = ""
+                    a_tag = row.find("a", href=True)
+                    if a_tag and "music.apple.com" in a_tag["href"]:
+                        apple_track_url = a_tag["href"]
 
-                isrc = None
+                    isrc = None
 
-                track = {
-                    "name": title,
-                    "artists": [{"name": artist}] if artist else [],
-                    "album": {"name": album},
-                    "external_urls": {"apple": apple_track_url},
-                    "external_ids": {"isrc": isrc},
-                }
+                    track = {
+                        "name": title,
+                        "artists": [{"name": artist}] if artist else [],
+                        "album": {"name": album},
+                        "external_urls": {"apple": apple_track_url},
+                        "external_ids": {"isrc": isrc},
+                    }
 
-                items.append({"track": track})
+                    items.append({"track": track})
         except Exception:
-            # If playwright is not available or rendering fails, continue with empty items
+            # If playwright is not available or rendering fails, continue with existing items
             pass
 
     playlist = {"id": url, "name": playlist_name, "external_urls": {"apple": url}}
