@@ -12,15 +12,19 @@ services:
       echo "=== Verifying Playwright installation ==="
       python3 -c "from playwright.sync_api import sync_playwright; print('Playwright imported successfully')" || echo "Warning: Playwright import failed"
       echo "=== Listing installed browsers ==="
-      ls -la ~/.cache/ms-playwright/ || echo "No playwright cache found"
+      ls -lah $HOME/.cache/ms-playwright/ || echo "No playwright cache found in HOME"
+      find /opt/render/.cache -name "*playwright*" -o -name "*chromium*" 2>/dev/null | head -20 || echo "No playwright in /opt/render/.cache"
+      echo "=== Checking browser executable ==="
+      ls -lah $HOME/.cache/ms-playwright/chromium*/chrome-linux/headless_shell 2>/dev/null || echo "Browser executable not found"
       echo "=== Build complete ==="
     startCommand: |
       echo "=== Checking Playwright installation before start ==="
-      if [ ! -d "$HOME/.cache/ms-playwright/chromium_headless_shell-1148" ]; then
-        echo "Playwright browsers not found, installing now..."
-        python3 -m playwright install --with-deps chromium
+      ls -lah $HOME/.cache/ms-playwright/ || echo "No playwright cache at startup"
+      if [ ! -f "$HOME/.cache/ms-playwright/chromium_headless_shell-1148/chrome-linux/headless_shell" ]; then
+        echo "WARNING: Playwright browser executable not found, attempting to install..."
+        python3 -m playwright install chromium || echo "Failed to install browsers"
       else
-        echo "Playwright browsers already installed"
+        echo "Playwright browsers found and ready"
       fi
       echo "=== Starting uvicorn ==="
       uvicorn app:app --host 0.0.0.0 --port $PORT
