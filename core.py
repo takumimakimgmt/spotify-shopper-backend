@@ -25,6 +25,7 @@ import unicodedata
 
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.exceptions import SpotifyException
 
 
 def _fix_mojibake(s: str) -> str:
@@ -278,19 +279,81 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     sp = get_spotify_client()
 
     # プレイリストメタ情報
-    playlist = sp.playlist(
-        playlist_id,
-        fields="id,name,external_urls",
-    )
+    try:
+        playlist = sp.playlist(
+            playlist_id,
+            fields="id,name,external_urls,owner.id",
+        )
+    except SpotifyException as e:
+        status = getattr(e, "http_status", None)
+        msg = getattr(e, "msg", str(e))
+        if status in (403, 404):
+            # Private/personalized or region-restricted editorial
+            editorial_hint = ""
+            try:
+                if re.match(r"^37i9", playlist_id or ""):
+                    editorial_hint = (
+                        " It may be an official editorial playlist (ID starts with 37i9) and region-restricted. "
+                        "Workaround: Create a new public playlist in your account and copy all tracks, then use that URL."
+                    )
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Failed to fetch this playlist from Spotify API ({}). "
+                "This may be a private or personalized playlist (e.g., Daily Mix / On Repeat / Blend) requiring user authentication, "
+                "or region-restricted.{} Original error: {}".format(status, editorial_hint, msg)
+            )
+        raise RuntimeError(f"Failed to fetch playlist metadata: {msg}")
 
-    # トラック全件（100曲以上にも対応）
+    # トラック全件（100曲以上にも対応）。市場（market）を指定して可用性差異に対応。
+    owner_id = (playlist.get("owner") or {}).get("id") if isinstance(playlist.get("owner"), dict) else None
+    is_official_edit = (owner_id == "spotify")
+    # 優先順は環境変数 SPOTIFY_MARKET（カンマ区切り可）、なければ JP,US,GB.
+    market_env = os.getenv("SPOTIFY_MARKET", "").strip()
+    markets: List[str] = [m.strip().upper() for m in market_env.split(",") if m.strip()] or ["JP", "US", "GB"]
+
+    last_error: Exception | None = None
     items: List[Dict[str, Any]] = []
-    results = sp.playlist_tracks(playlist_id, limit=100, offset=0)
-    items.extend(results.get("items", []))
+    results = None
+    for market in markets:
+        try:
+            results = sp.playlist_tracks(playlist_id, limit=100, offset=0, market=market)
+            items.extend(results.get("items", []))
+            # paginate
+            while results.get("next"):
+                try:
+                    results = sp.next(results)
+                except SpotifyException as e:
+                    status = getattr(e, "http_status", None)
+                    msg = getattr(e, "msg", str(e))
+                    raise RuntimeError(f"Failed to fetch next page of tracks ({status}) for market {market}: {msg}")
+                items.extend(results.get("items", []))
+            # success for this market
+            break
+        except SpotifyException as e:
+            last_error = e
+            status = getattr(e, "http_status", None)
+            msg = getattr(e, "msg", str(e))
+            # For 403/404, try next market; otherwise stop immediately
+            if status not in (403, 404):
+                raise RuntimeError(f"Failed to fetch playlist tracks: {msg}")
+            # continue to next market
+            continue
 
-    while results.get("next"):
-        results = sp.next(results)
-        items.extend(results.get("items", []))
+    if results is None or (not items and last_error is not None):
+        # Exhausted markets
+        status = getattr(last_error, "http_status", None) if last_error else None
+        msg = getattr(last_error, "msg", str(last_error)) if last_error else "Unknown error"
+        prefix = "Failed to fetch playlist tracks from Spotify API. "
+        if is_official_edit:
+            prefix += "This looks like an official editorial playlist (owner=spotify). "
+        hint = (
+            "This playlist may be region-locked or personalized/private. "
+            f"Tried markets: {','.join(markets)}. Last error ({status}): {msg}. "
+            "You can set SPOTIFY_MARKET (e.g., 'JP' or 'US') to control the market. "
+            "Workaround: Create a new public playlist in your account and copy all tracks into it, then use that new playlist URL."
+        )
+        raise RuntimeError(prefix + hint)
 
     return {
         "playlist": playlist,
@@ -688,11 +751,13 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
             if album_el and album_el.get_text(strip=True):
                 album = album_el.get_text(strip=True)
 
-            # apple track url
+            # apple track url: prefer direct song links
             apple_track_url = ""
-            a_tag = row.find("a", href=True)
-            if a_tag and "music.apple.com" in a_tag["href"]:
-                apple_track_url = a_tag["href"]
+            for a in row.find_all("a", href=True):
+                href = a.get("href", "")
+                if "music.apple.com" in href and "/song/" in href:
+                    apple_track_url = href
+                    break
 
             isrc = None
 
@@ -739,9 +804,11 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                                     break
                         
                         apple_track_url = ""
-                        a_tag = row.find("a", href=True)
-                        if a_tag and "music.apple.com" in a_tag["href"]:
-                            apple_track_url = a_tag["href"]
+                        for a in row.find_all("a", href=True):
+                            href = a.get("href", "")
+                            if "music.apple.com" in href and "/song/" in href:
+                                apple_track_url = href
+                                break
                         
                         isrc = None
                         
@@ -804,9 +871,11 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                         album = album_el.get_text(strip=True)
 
                     apple_track_url = ""
-                    a_tag = row.find("a", href=True)
-                    if a_tag and "music.apple.com" in a_tag["href"]:
-                        apple_track_url = a_tag["href"]
+                    for a in row.find_all("a", href=True):
+                        href = a.get("href", "")
+                        if "music.apple.com" in href and "/song/" in href:
+                            apple_track_url = href
+                            break
 
                     isrc = None
 

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: spotify-shopper
+    env: python
+    rootDir: spotify-shopper
+    buildCommand: |
+      pip install -r requirements.txt
+      python -m playwright install --with-deps chromium
+    startCommand: |
+      uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: SPOTIFY_MARKET
+        value: JP,US,GB
+      - key: ALLOWED_ORIGINS
+        # Set to your Vercel domain(s), comma-separated. Example:
+        # value: https://your-app.vercel.app,https://www.yourdomain.com
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
