@@ -40,7 +40,7 @@ class TrackModel(BaseModel):
     title: str
     artist: str
     album: Optional[str] = None
-    bpm: Optional[int] = None
+    isrc: Optional[str] = None
     spotify_url: Optional[str] = None
     apple_url: Optional[str] = None
     links: Optional[StoreLinksModel] = None
