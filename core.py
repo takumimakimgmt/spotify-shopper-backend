@@ -398,11 +398,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     playlist_id = playlist.get("id") or ""
     playlist_name = playlist.get("name") or ""
-    # attempt to fix mojibake in playlist name as well
-    try:
-        playlist_name = _fix_mojibake(playlist_name)
-    except Exception:
-        pass
+    # Spotify API always returns correct UTF-8, just normalize
     try:
         playlist_name = unicodedata.normalize("NFC", playlist_name)
     except Exception:
@@ -426,9 +422,8 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         if track.get("is_local"):
             continue
 
-        # Normalize textual fields and attempt to fix mojibake
+        # Normalize textual fields (Spotify API always returns correct UTF-8)
         title = track.get("name") or ""
-        title = _fix_mojibake(title)
         try:
             title = unicodedata.normalize("NFC", title)
         except Exception:
@@ -440,7 +435,6 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
             an = a.get("name")
             if not an:
                 continue
-            an = _fix_mojibake(an)
             try:
                 an = unicodedata.normalize("NFC", an)
             except Exception:
@@ -449,14 +443,12 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         artist_name = ", ".join(artist_parts)
 
         album_name = album.get("name") or ""
-        album_name = _fix_mojibake(album_name)
         try:
             album_name = unicodedata.normalize("NFC", album_name)
         except Exception:
             pass
         spotify_url = track.get("external_urls", {}).get("spotify", "")
         apple_url = track.get("external_urls", {}).get("apple", "")
-        bpm = track.get("tempo")  # BPM from Spotify
         isrc = (track.get("external_ids") or {}).get("isrc")  # ISRC from Spotify
 
         links = build_store_links(title, artist_name, album_name)
@@ -516,15 +508,14 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
 
     now = time.time()
     last_ts = last.get(url, 0)
-    if now - last_ts < 2:
-        # If cached, return cached; otherwise wait briefly to avoid hammering
-        if url in cache:
-            return cache[url]
-        time.sleep(1)
-
+    
     # Return cached result if available
     if url in cache:
         return cache[url]
+    
+    # Throttle repeated requests for same URL
+    if now - last_ts < 2:
+        time.sleep(1)
 
     # Try static HTML parsing first
     resp = requests.get(url, timeout=10, headers={"User-Agent": "spotify-shopper/1.0 (+https://github.com)"})
