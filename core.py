@@ -392,7 +392,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
             pass
         spotify_url = track.get("external_urls", {}).get("spotify", "")
         apple_url = track.get("external_urls", {}).get("apple", "")
-        isrc = (track.get("external_ids") or {}).get("isrc")
+        bpm = track.get("tempo")  # BPM from Spotify
 
         links = build_store_links(title, artist_name, album_name)
 
@@ -401,7 +401,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "title": title,
                 "artist": artist_name,
                 "album": album_name,
-                "isrc": isrc,
+                "bpm": round(bpm) if bpm else None,
                 "spotify_url": spotify_url,
                 "apple_url": apple_url,
                 "links": links,
@@ -859,10 +859,10 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
                 if album:
                     track["album"] = {"name": album.get("name", "")}
                 
-                # Add ISRC if available
-                sp_external_ids = sp_track.get("external_ids", {})
-                if sp_external_ids.get("isrc"):
-                    track["external_ids"] = {"isrc": sp_external_ids.get("isrc")}
+                # Add BPM (tempo) if available
+                tempo = sp_track.get("tempo")
+                if tempo:
+                    track["bpm"] = round(tempo)  # Round to nearest integer
                 
                 # Preserve Apple URL, add Spotify URL
                 sp_url = sp_track.get("external_urls", {}).get("spotify")
