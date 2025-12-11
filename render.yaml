@@ -4,11 +4,16 @@ services:
     env: python
     buildCommand: |
       set -e
-      echo "Installing Python dependencies..."
+      echo "=== Installing Python dependencies ==="
+      pip install --upgrade pip
       pip install -r requirements.txt
-      echo "Installing Playwright browsers and dependencies..."
-      python -m playwright install --with-deps chromium
-      echo "Build complete"
+      echo "=== Installing Playwright browsers with system dependencies ==="
+      python3 -m playwright install --with-deps chromium
+      echo "=== Verifying Playwright installation ==="
+      python3 -c "from playwright.sync_api import sync_playwright; print('Playwright imported successfully')" || echo "Warning: Playwright import failed"
+      echo "=== Listing installed browsers ==="
+      ls -la ~/.cache/ms-playwright/ || echo "No playwright cache found"
+      echo "=== Build complete ==="
     startCommand: |
       uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
