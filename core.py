@@ -828,15 +828,16 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
             enriched_items.append(item)
             continue
         
-        # If artist is missing, try to enrich with Spotify search anyway
+        # If artist is missing, still try to search by title alone
         if not artist_name:
-            print(f"Debug: Apple track has no artist: {title}")
-            enriched_items.append(item)
-            continue
+            print(f"Debug: Apple track has no artist, searching by title: {title}")
         
-        # Search Spotify for this track
+        # Search Spotify for this track (with or without artist)
         try:
-            query = f"track:{title} artist:{artist_name}"
+            if artist_name:
+                query = f"track:{title} artist:{artist_name}"
+            else:
+                query = f"track:{title}"
             print(f"Debug: Searching Spotify for: {query}")
             results = sp.search(q=query, type="track", limit=3)
             tracks = results.get("tracks", {}).get("items", [])
