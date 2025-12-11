@@ -792,12 +792,85 @@ def _fetch_with_playwright(url: str) -> str:
     return content
 
 
+def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Takes an Apple Music playlist result and enriches each track with Spotify data
+    (artist, album, ISRC) by searching Spotify for matching tracks.
+    
+    This allows us to get full metadata for Apple Music playlists.
+    """
+    try:
+        sp = get_spotify_client()
+    except Exception:
+        # If Spotify client unavailable, return as-is
+        return result
+    
+    items = result.get("items", [])
+    enriched_items = []
+    
+    for item in items:
+        track = item.get("track", {})
+        title = track.get("name", "")
+        artists = track.get("artists", [])
+        artist_name = artists[0].get("name", "") if artists else ""
+        
+        if not title or not artist_name:
+            # Can't search without title and artist
+            enriched_items.append(item)
+            continue
+        
+        # Search Spotify for this track
+        try:
+            query = f"track:{title} artist:{artist_name}"
+            results = sp.search(q=query, type="track", limit=1)
+            tracks = results.get("tracks", {}).get("items", [])
+            
+            if tracks:
+                # Use first match to enrich metadata
+                sp_track = tracks[0]
+                
+                # Update artist info if better
+                sp_artists = sp_track.get("artists", [])
+                if sp_artists:
+                    track["artists"] = [{"name": a.get("name", "")} for a in sp_artists]
+                
+                # Update album info
+                album = sp_track.get("album", {})
+                if album:
+                    track["album"] = {"name": album.get("name", "")}
+                
+                # Add ISRC if available
+                sp_external_ids = sp_track.get("external_ids", {})
+                if sp_external_ids.get("isrc"):
+                    track["external_ids"] = {"isrc": sp_external_ids.get("isrc")}
+                
+                # Add Spotify URL if available
+                sp_url = sp_track.get("external_urls", {}).get("spotify")
+                if sp_url:
+                    track["external_urls"] = {
+                        "spotify": sp_url,
+                        "apple": track.get("external_urls", {}).get("apple", "")
+                    }
+        except Exception as e:
+            # On search error, keep original track data
+            print(f"Warning: Failed to enrich track '{title}' with Spotify data: {e}")
+        
+        enriched_items.append({"track": track})
+    
+    result["items"] = enriched_items
+    return result
+
+
 def fetch_playlist_tracks_generic(source: str, url_or_id: str) -> Dict[str, Any]:
     """
     Dispatch between spotify/apple sources. Default to spotify for compatibility.
+    For Apple Music, enriches tracks with Spotify metadata (artist, album, ISRC).
     """
     src = (source or "spotify").lower()
     if src == "apple":
-        return fetch_apple_playlist_tracks_from_web(url_or_id)
+        result = fetch_apple_playlist_tracks_from_web(url_or_id)
+        # Enrich Apple tracks with Spotify metadata
+        result = _enrich_apple_tracks_with_spotify(result)
+        return result
     else:
         return fetch_playlist_tracks(url_or_id)
