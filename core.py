@@ -233,15 +233,6 @@ def extract_playlist_id(url_or_id: str) -> str:
 # =========================
 
 
-def build_search_query(title: str, artist: str, album: str | None = None) -> str:
-    """
-    ストア検索用のベースクエリを作る。
-    一旦シンプルに「タイトル + アーティスト (+ アルバム)」で。
-    """
-    parts = [title.strip(), artist.strip()]
-    if album:
-        parts.append(album.strip())
-    return " ".join(p for p in parts if p)
 
 
 def build_store_links(title: str, artist: str, album: str | None = None) -> Dict[str, str]:
