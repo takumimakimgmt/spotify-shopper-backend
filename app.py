@@ -84,6 +84,7 @@ MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 5 * 1024 * 1024))
 default_origins = [
     "http://localhost:3000",
     "https://spotify-shopper.vercel.app",
+    "https://playlist-shopper.vercel.app",
 ]
 
 # 環境変数 ALLOWED_ORIGINS があればそれを優先（カンマ区切り）
