@@ -389,6 +389,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         spotify_url = track.get("external_urls", {}).get("spotify", "")
         apple_url = track.get("external_urls", {}).get("apple", "")
         bpm = track.get("tempo")  # BPM from Spotify
+        isrc = (track.get("external_ids") or {}).get("isrc")  # ISRC from Spotify
 
         links = build_store_links(title, artist_name, album_name)
 
@@ -397,7 +398,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "title": title,
                 "artist": artist_name,
                 "album": album_name,
-                "bpm": round(bpm) if bpm else None,
+                "isrc": isrc,
                 "spotify_url": spotify_url,
                 "apple_url": apple_url,
                 "links": links,
