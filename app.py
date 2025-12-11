@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -116,34 +115,6 @@ def health() -> Dict[str, str]:
 # Core helpers
 # =========================
 
-def _normalize_playlist_id(raw: str) -> str:
-    """
-    Spotify プレイリスト URL / ID を、純粋な playlist ID に正規化する。
-
-    OK:
-      - 0ZzPDztlFcDLdLbBa7hOks
-      - https://open.spotify.com/playlist/0ZzPDztlFcDLdLbBa7hOks?si=xxxx
-      - https://open.spotify.com/playlist/0ZzPDztlFcDLdLbBa7hOks
-    """
-    raw = raw.strip()
-
-    # 素の ID だけ来た場合でも、"id?si=..." 形式でも対応
-    if raw.startswith("http://") or raw.startswith("https://"):
-        parsed = urlparse(raw)
-        parts = parsed.path.strip("/").split("/")
-        # /playlist/<id> という形を想定
-        if len(parts) >= 2 and parts[0] == "playlist":
-            playlist_id = parts[1]
-        else:
-            # それ以外のパターンは想定外として 400
-            raise HTTPException(status_code=400, detail="Unsupported Spotify playlist URL")
-    else:
-        # URL じゃなければ ID とみなす。?si= 付いてても切り捨て。
-        playlist_id = raw.split("?", 1)[0]
-
-    return playlist_id
-
-
 def _sanitize_url(raw: str) -> str:
     """
     Basic server-side URL sanitization: trim whitespace, strip surrounding
@@ -157,18 +128,6 @@ def _sanitize_url(raw: str) -> str:
     # strip surrounding quotes
     s = s.strip('\'"')
     return s
-
-
-def _fetch_playlist_data(url: str, source: str = "spotify") -> Dict[str, Any]:
-    """指定した `source` (spotify|apple) でプレイリストを取得して dict 形式に変換。"""
-    try:
-        result = fetch_playlist_tracks_generic(source, url)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    data = playlist_result_to_dict(result)
-    return data
-
 
 
 def _apply_rekordbox_owned_flags(
@@ -232,7 +191,12 @@ def playlist_with_rekordbox(body: PlaylistWithRekordboxBody):
       "rekordbox_xml_path": "/Users/xxx/Desktop/rekordbox_collection.xml"
     }
     """
-    playlist_data = _fetch_playlist_data(body.url, getattr(body, "source", "spotify"))
+    try:
+        result = fetch_playlist_tracks_generic(getattr(body, "source", "spotify"), body.url)
+        playlist_data = playlist_result_to_dict(result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
     playlist_with_owned = _apply_rekordbox_owned_flags(
         playlist_data,
         body.rekordbox_xml_path,

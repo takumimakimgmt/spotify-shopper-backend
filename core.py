@@ -239,13 +239,10 @@ def extract_playlist_id(url_or_id: str) -> str:
 def build_store_links(title: str, artist: str, album: str | None = None) -> Dict[str, str]:
     """
     Beatport / Bandcamp / iTunes (Apple Music) の検索リンクを生成。
+    Note: album is accepted but not used in search query to avoid reducing results.
     """
-    # Build search query from title, artist, album
-    parts = [title.strip(), artist.strip()]
-    if album:
-        parts.append(album.strip())
-    query = " ".join(p for p in parts if p)
-    
+    # Build search query from title and artist only (album can reduce results)
+    query = f"{title.strip()} {artist.strip()}".strip()
     q = urllib.parse.quote_plus(query)
 
     beatport = f"https://www.beatport.com/search?q={q}"
