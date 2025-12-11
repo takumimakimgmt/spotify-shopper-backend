@@ -2,7 +2,6 @@ services:
   - type: web
     name: spotify-shopper
     env: python
-    rootDir: spotify-shopper
     buildCommand: |
       set -e
       echo "Installing Python dependencies..."
