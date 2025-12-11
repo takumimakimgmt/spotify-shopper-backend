@@ -218,20 +218,21 @@ def _similar(a: str, b: str) -> float:
 def mark_owned_tracks(playlist_data: dict, rekordbox_xml_path: str | Path) -> dict:
     """
     playlist_data: playlist_result_to_dict() の戻り（dict）
-    RekordboxライブラリXMLと突き合わせて、各 track に owned: bool を付与して返す。
+    RekordboxライブラリXMLと突き合わせて、各 track に owned: bool と owned_reason を付与して返す。
 
     判定の順番:
-    1. ISRC 完全一致
-    2. (title_norm, artist_norm) の組み合わせ一致
+    1. ISRC 完全一致 → owned_reason = 'isrc'
+    2. (title_norm, artist_norm) の組み合わせ一致 → owned_reason = 'exact'
        - Rekordbox側は "ARTIST - TITLE" パターンなどを含む複数候補を持つ
-    3. (title_norm, album_norm) の組み合わせ一致
+    3. (title_norm, album_norm) の組み合わせ一致 → owned_reason = 'album'
        - 有名アーティストがカタカナ表記になっていても、タイトル＋アルバムで拾う
-    4. 同一 artist_norm 内で title_norm 類似度 >= 0.92
+    4. 同一 artist_norm 内で title_norm 類似度 >= 0.92 → owned_reason = 'fuzzy'
     """
     lib = load_rekordbox_library_xml(rekordbox_xml_path)
 
     for t in playlist_data.get("tracks", []):
         owned = False
+        owned_reason = None
 
         title_norm = normalize_title_base(t["title"])
         artist_norm = normalize_artist(t["artist"])
@@ -241,12 +242,14 @@ def mark_owned_tracks(playlist_data: dict, rekordbox_xml_path: str | Path) -> di
         isrc = t.get("isrc")
         if isrc and lib.by_isrc.get(isrc.upper()):
             owned = True
+            owned_reason = "isrc"
 
         # 2) タイトル＋アーティスト（正規化）の組み合わせ一致
         if not owned and title_norm and artist_norm:
             key = (title_norm, artist_norm)
             if key in lib.by_title_artist:
                 owned = True
+                owned_reason = "exact"
 
         # 3) タイトル＋アルバム（正規化）の組み合わせ一致
         #    → アーティスト名がカタカナ／別表記でも拾えるようにする
@@ -254,6 +257,7 @@ def mark_owned_tracks(playlist_data: dict, rekordbox_xml_path: str | Path) -> di
             key2 = (title_norm, album_norm)
             if key2 in lib.by_title_album:
                 owned = True
+                owned_reason = "album"
 
         # 4) 同一アーティスト内でタイトル類似度を見る（かなり閾値高め）
         if not owned and title_norm and artist_norm:
@@ -266,7 +270,9 @@ def mark_owned_tracks(playlist_data: dict, rekordbox_xml_path: str | Path) -> di
 
             if best >= 0.92:
                 owned = True
+                owned_reason = "fuzzy"
 
         t["owned"] = owned
+        t["owned_reason"] = owned_reason
 
     return playlist_data

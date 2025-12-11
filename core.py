@@ -236,18 +236,42 @@ def extract_playlist_id(url_or_id: str) -> str:
 
 
 
-def build_store_links(title: str, artist: str, album: str | None = None) -> Dict[str, str]:
+def build_store_links(title: str, artist: str, album: str | None = None, isrc: str | None = None) -> Dict[str, str]:
     """
     Beatport / Bandcamp / iTunes (Apple Music) の検索リンクを生成。
-    Note: album is accepted but not used in search query to avoid reducing results.
+    
+    ISRC が存在する場合:
+    - Beatport: ISRC を含むクエリで検索（ISRC検索が強い）
+    - iTunes: ISRC を含むクエリで検索（ISRC検索が強い）
+    - Bandcamp: title + artist（ISRC非対応のため従来通り）
+    
+    ISRC がない場合:
+    - 全て title + artist で検索（album を含めると結果が減るため除外）
     """
-    # Build search query from title and artist only (album can reduce results)
-    query = f"{title.strip()} {artist.strip()}".strip()
-    q = urllib.parse.quote_plus(query)
-
-    beatport = f"https://www.beatport.com/search?q={q}"
-    bandcamp = f"https://bandcamp.com/search?q={q}"
-    itunes = f"https://music.apple.com/search?term={q}"
+    # ISRC がある場合は ISRC ベースのクエリを優先
+    if isrc:
+        isrc_clean = isrc.strip().upper()
+        # Beatport: ISRC + artist で検索
+        beatport_query = f"{isrc_clean} {artist.strip()}".strip()
+        beatport_q = urllib.parse.quote_plus(beatport_query)
+        beatport = f"https://www.beatport.com/search?q={beatport_q}"
+        
+        # iTunes: ISRC で検索
+        itunes_q = urllib.parse.quote_plus(isrc_clean)
+        itunes = f"https://music.apple.com/search?term={itunes_q}"
+        
+        # Bandcamp: ISRC 非対応なので title + artist
+        bandcamp_query = f"{title.strip()} {artist.strip()}".strip()
+        bandcamp_q = urllib.parse.quote_plus(bandcamp_query)
+        bandcamp = f"https://bandcamp.com/search?q={bandcamp_q}"
+    else:
+        # ISRC がない場合は従来通り title + artist
+        query = f"{title.strip()} {artist.strip()}".strip()
+        q = urllib.parse.quote_plus(query)
+        
+        beatport = f"https://www.beatport.com/search?q={q}"
+        bandcamp = f"https://bandcamp.com/search?q={q}"
+        itunes = f"https://music.apple.com/search?term={q}"
 
     return {
         "beatport": beatport,
@@ -448,7 +472,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         apple_url = track.get("external_urls", {}).get("apple", "")
         isrc = (track.get("external_ids") or {}).get("isrc")  # ISRC from Spotify
 
-        links = build_store_links(title, artist_name, album_name)
+        links = build_store_links(title, artist_name, album_name, isrc=isrc)
 
         tracks_out.append(
             {

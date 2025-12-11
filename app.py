@@ -44,6 +44,7 @@ class TrackModel(BaseModel):
     apple_url: Optional[str] = None
     links: Optional[StoreLinksModel] = None
     owned: Optional[bool] = None
+    owned_reason: Optional[str] = None
 
 
 class PlaylistResponse(BaseModel):
