@@ -4,8 +4,12 @@ services:
     env: python
     rootDir: spotify-shopper
     buildCommand: |
+      set -e
+      echo "Installing Python dependencies..."
       pip install -r requirements.txt
+      echo "Installing Playwright browsers and dependencies..."
       python -m playwright install --with-deps chromium
+      echo "Build complete"
     startCommand: |
       uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:

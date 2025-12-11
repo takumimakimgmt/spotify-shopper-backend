@@ -680,21 +680,40 @@ def _fetch_with_playwright(url: str) -> str:
     except Exception as e:
         raise RuntimeError("Playwright is not installed or cannot be imported: %s" % e)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        try:
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=20000)
-            # give extra time for dynamic content
-            page.wait_for_timeout(500)
-            content = page.content()
-        finally:
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
             try:
-                browser.close()
-            except Exception:
-                pass
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=20000)
+                # give extra time for dynamic content
+                page.wait_for_timeout(500)
+                content = page.content()
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
-    return content
+        return content
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Check if Playwright browser is not installed
+        if "Executable doesn't exist" in error_msg or "chrome-linux" in error_msg:
+            raise RuntimeError(
+                "Playwright browser executable not found. "
+                "This typically happens on Render.com or other cloud deployment platforms. "
+                "The build must include: python -m playwright install --with-deps chromium\n\n"
+                f"Original error: {error_msg}"
+            )
+        elif "PLAYWRIGHT" in error_msg.upper() or "browser" in error_msg.lower():
+            raise RuntimeError(
+                f"Playwright initialization failed: {error_msg}\n\n"
+                "Please ensure Playwright is properly installed with: pip install -r requirements.txt"
+            )
+        else:
+            raise RuntimeError(f"Failed to fetch page with Playwright: {error_msg}")
 
 
 def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
