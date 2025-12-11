@@ -15,6 +15,14 @@ services:
       ls -la ~/.cache/ms-playwright/ || echo "No playwright cache found"
       echo "=== Build complete ==="
     startCommand: |
+      echo "=== Checking Playwright installation before start ==="
+      if [ ! -d "$HOME/.cache/ms-playwright/chromium_headless_shell-1148" ]; then
+        echo "Playwright browsers not found, installing now..."
+        python3 -m playwright install --with-deps chromium
+      else
+        echo "Playwright browsers already installed"
+      fi
+      echo "=== Starting uvicorn ==="
       uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: SPOTIFY_CLIENT_ID
