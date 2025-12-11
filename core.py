@@ -932,16 +932,15 @@ def _fetch_with_playwright(url: str) -> str:
 
 def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Takes an Apple Music playlist result and enriches each track with Spotify data
-    (artist, album, ISRC) by searching Spotify for matching tracks.
+    Takes an Apple Music playlist result and enriches each track with ISRC
+    by searching Spotify for matching tracks.
     
-    This allows us to get full metadata for Apple Music playlists.
+    This preserves Apple's original artist/album/URL metadata completely.
     """
     try:
         sp = get_spotify_client()
-    except Exception as e:
-        # If Spotify client unavailable, log and return as-is
-        print(f"Warning: Spotify client unavailable for enrichment: {e}")
+    except Exception:
+        # If Spotify client unavailable, return as-is (ISRC will remain null)
         return result
     
     items = result.get("items", [])
@@ -953,41 +952,28 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
         artists = track.get("artists", [])
         artist_name = artists[0].get("name", "").strip() if artists else ""
         
-        if not title:
-            # Can't search without title
+        # Skip enrichment if no title or artist (low match accuracy)
+        if not title or not artist_name:
             enriched_items.append(item)
             continue
         
-        # If artist is missing, still try to search by title alone
-        if not artist_name:
-            print(f"Debug: Apple track has no artist, searching by title: {title}")
-        
-        # Search Spotify for this track (with or without artist)
+        # Search Spotify for ISRC
         try:
-            if artist_name:
-                query = f"track:{title} artist:{artist_name}"
-            else:
-                query = f"track:{title}"
-            print(f"Debug: Searching Spotify for: {query}")
-            results = sp.search(q=query, type="track", limit=3)
+            query = f"track:{title} artist:{artist_name}"
+            results = sp.search(q=query, type="track", limit=1)
             tracks = results.get("tracks", {}).get("items", [])
             
             if tracks:
-                # Use first match to enrich ISRC only (preserve Apple's original artist/album)
+                # Extract ISRC only (preserve all Apple metadata)
                 sp_track = tracks[0]
-                print(f"Debug: Found match: {sp_track.get('name')} by {[a.get('name') for a in sp_track.get('artists', [])]}")
-                
-                # Add ISRC if available (only ISRC, keep Apple's original artist/album/URLs)
                 isrc = sp_track.get("external_ids", {}).get("isrc")
                 if isrc:
                     if "external_ids" not in track:
                         track["external_ids"] = {}
                     track["external_ids"]["isrc"] = isrc
-            else:
-                print(f"Debug: No Spotify match for: {query}")
-        except Exception as e:
-            # On search error, keep original track data
-            print(f"Warning: Failed to enrich track '{title}' with Spotify data: {e}")
+        except Exception:
+            # On search error, keep original track data without ISRC
+            pass
         
         enriched_items.append({"track": track})
     
