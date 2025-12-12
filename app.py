@@ -15,7 +15,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core import fetch_playlist_tracks_generic, playlist_result_to_dict
+from core import fetch_playlist_tracks_generic, playlist_result_to_dict, enrich_isrc_for_items
 from rekordbox import mark_owned_tracks
 import logging
 
@@ -72,10 +72,7 @@ app = FastAPI(
 
 @app.on_event("startup")
 def _log_startup():
-    try:
-        logger.info("spotify-shopper: startup event triggered")
-    except Exception:
-        print("spotify-shopper: startup event triggered")
+    logger.info("spotify-shopper: startup event triggered")
 
 # 最大アップロードサイズ（バイト） - デフォルト 5MB
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 5 * 1024 * 1024))
@@ -154,6 +151,8 @@ def _apply_rekordbox_owned_flags(
 def get_playlist(
     url: str = Query(..., description="Playlist URL or ID or URL"),
     source: str = Query("spotify", description="spotify or apple"),
+    enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
+    isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
 ):
     """
     プレイリストだけを取得（Rekordbox 突き合わせなし）。
@@ -164,17 +163,22 @@ def get_playlist(
     if "music.apple.com" in (clean_url or "").lower():
         src = "apple"
 
-    try:
-        logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
-    except Exception:
-        try:
-            print(f"[api/playlist] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
-        except Exception:
-            pass
+    logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
 
     # Call core directly so we can attach debug info on failure
     try:
         result = fetch_playlist_tracks_generic(src, clean_url)
+        # Optional ISRC enrichment (best-effort)
+        if enrich_isrc and isinstance(result, dict):
+            try:
+                items = result.get("items", [])
+                updated = enrich_isrc_for_items(items, limit=isrc_limit)
+                result["items"] = items
+                result.setdefault("meta", {})
+                result["meta"]["isrc_enriched"] = updated
+            except Exception as _:
+                # ignore enrichment errors
+                pass
         data = playlist_result_to_dict(result)
         return data
     except Exception as e:
@@ -196,7 +200,7 @@ def playlist_with_rekordbox(body: PlaylistWithRekordboxBody):
         result = fetch_playlist_tracks_generic(getattr(body, "source", "spotify"), body.url)
         playlist_data = playlist_result_to_dict(result)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail={"error": str(e)})
     
     playlist_with_owned = _apply_rekordbox_owned_flags(
         playlist_data,
@@ -224,13 +228,7 @@ async def playlist_with_rekordbox_upload(
     if "music.apple.com" in (clean_url or "").lower():
         src = "apple"
 
-    try:
-        logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
-    except Exception:
-        try:
-            print(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
-        except Exception:
-            pass
+    logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
 
     try:
         result = fetch_playlist_tracks_generic(src, clean_url)

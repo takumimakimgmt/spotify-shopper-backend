@@ -14,6 +14,7 @@ import os
 import re
 import urllib.parse
 from typing import Any, Dict, List
+import logging
 
 import requests
 import html as _html
@@ -26,6 +27,9 @@ import unicodedata
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy.exceptions import SpotifyException
+
+# Configure logger for this module
+logger = logging.getLogger(__name__)
 
 
 def _fix_mojibake(s: str) -> str:
@@ -297,6 +301,26 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     実際に使いやすい dict への変換は playlist_result_to_dict() で行う。
     """
     playlist_id = extract_playlist_id(url_or_id)
+    
+    # Early detection: Check if this is an official editorial playlist (37i9...)
+    if re.match(r"^37i9", playlist_id):
+        logger.warning(f"[Spotify] Detected official editorial playlist: {playlist_id}")
+        raise RuntimeError(
+            "このプレイリストはSpotify公式のエディトリアルプレイリスト（ID: 37i9...）です。\n"
+            "公式プレイリストは地域制限があり、取得できない場合があります。\n\n"
+            "解決方法：\n"
+            "1. あなたのアカウントで新しい公開プレイリストを作成\n"
+            "2. このプレイリストの全曲をコピー\n"
+            "3. 新しいプレイリストのURLを使用してください\n\n"
+            "---\n\n"
+            "This is an official Spotify editorial playlist (ID starts with 37i9).\n"
+            "Official playlists may be region-restricted and unavailable via API.\n\n"
+            "Workaround:\n"
+            "1. Create a new public playlist in your Spotify account\n"
+            "2. Copy all tracks from this playlist\n"
+            "3. Use the new playlist URL instead"
+        )
+    
     sp = get_spotify_client()
 
     # プレイリストメタ情報
@@ -546,19 +570,23 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
     try:
         html = _fetch_with_playwright(url)
         soup = BeautifulSoup(html, "html.parser")
+        logger.info(f"[Apple Music] Parsing HTML ({len(html)} bytes)")
         
         # Extract playlist name from rendered page
         h1 = soup.find("h1")
         if h1 and h1.get_text(strip=True):
-            playlist_name = h1.get_text(strip=True)
+            playlist_name = _fix_mojibake(h1.get_text(strip=True))
+            logger.info(f"[Apple Music] Found playlist name: {playlist_name}")
         elif soup.title and soup.title.string:
-            playlist_name = soup.title.string.strip()
+            playlist_name = _fix_mojibake(soup.title.string.strip())
+            logger.info(f"[Apple Music] Using title as playlist name: {playlist_name}")
         
         # Try role="row" selector from Apple Music table layout
         rows = soup.find_all(attrs={'role': 'row'})
+        logger.info(f"[Apple Music] Found {len(rows)} rows")
         if rows:
             # Skip header row (first row)
-            for row in rows[1:]:
+            for idx, row in enumerate(rows[1:], start=1):
                 # Use pipe separator to split into cells, then clean up
                 text = row.get_text(separator='|')
                 parts = [p.strip() for p in text.split('|') if p.strip()]
@@ -566,16 +594,16 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                 if len(parts) >= 5:
                     # Format: [song, artist, rank?, artist_dup, album, preview(?), time]
                     # Pick fields by position
-                    title = parts[0] if len(parts) > 0 else ""
-                    artist = parts[1] if len(parts) > 1 else ""
+                    title = _fix_mojibake(parts[0]) if len(parts) > 0 else ""
+                    artist = _fix_mojibake(parts[1]) if len(parts) > 1 else ""
                     # Album should be at index 4 or later, but skip preview/time
                     album = ""
-                    for idx in range(4, len(parts)):
-                        candidate = parts[idx]
+                    for part_idx in range(4, len(parts)):
+                        candidate = parts[part_idx]
                         # Skip "プレビュー", "preview" and time format
                         if candidate and candidate not in ("プレビュー", "preview"):
                             if not (":" in candidate and candidate.count(":") == 1):
-                                album = candidate
+                                album = _fix_mojibake(candidate)
                                 break
                     
                     apple_track_url = ""
@@ -599,11 +627,13 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
         
         # Fallback: if role=row didn't work, try other selectors
         if not items:
+            logger.info(f"[Apple Music] Role=row parsing found 0 tracks, trying fallback selectors")
             candidates = []
             candidates.extend(soup.select("ol li"))
             candidates.extend(soup.select("ul li"))
             candidates.extend(soup.select("div[role='listitem']"))
             candidates.extend(soup.select("div.songs-list-row"))
+            logger.info(f"[Apple Music] Found {len(candidates)} fallback candidates")
 
             seen = set()
             for row in candidates:
@@ -615,27 +645,27 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                 title = ""
                 t_el = row.select_one("h3") or row.select_one("[data-test-song-title]") or row.select_one(".songs-list-row__song-title")
                 if t_el and t_el.get_text(strip=True):
-                    title = t_el.get_text(strip=True)
+                    title = _fix_mojibake(t_el.get_text(strip=True))
                 else:
                     b = row.select_one("strong") or row.select_one("b")
                     if b and b.get_text(strip=True):
-                        title = b.get_text(strip=True)
+                        title = _fix_mojibake(b.get_text(strip=True))
                     else:
-                        title = text.split("—")[0].strip()
+                        title = _fix_mojibake(text.split("—")[0].strip())
 
                 artist = ""
                 a_el = row.select_one(".songs-list-row__by-line") or row.select_one("[data-test-artist-name]") or row.select_one(".byline")
                 if a_el and a_el.get_text(strip=True):
-                    artist = a_el.get_text(strip=True)
+                    artist = _fix_mojibake(a_el.get_text(strip=True))
                 else:
                     parts = text.split("–")
                     if len(parts) >= 2:
-                        artist = parts[1].strip()
+                        artist = _fix_mojibake(parts[1].strip())
 
                 album = ""
                 album_el = row.select_one(".songs-list-row__collection") or row.select_one("[data-test-album-name]")
                 if album_el and album_el.get_text(strip=True):
-                    album = album_el.get_text(strip=True)
+                    album = _fix_mojibake(album_el.get_text(strip=True))
 
                 apple_track_url = ""
                 for a in row.find_all("a", href=True):
@@ -655,9 +685,15 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
                 }
 
                 items.append({"track": track})
+        
+        logger.info(f"[Apple Music] Successfully parsed {len(items)} tracks")
     except Exception as e:
         # If Playwright is not available or rendering fails, raise error
+        logger.error(f"[Apple Music] Failed to fetch playlist: {e}")
         raise RuntimeError(f"Failed to fetch Apple Music playlist with Playwright: {e}")
+    
+    if not items:
+        logger.warning(f"[Apple Music] No tracks found in playlist at {url}")
     
     playlist = {"id": url, "name": playlist_name, "external_urls": {"apple": url}}
 
@@ -666,6 +702,7 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
     # cache and record timestamp
     cache[url] = result
     last[url] = time.time()
+    logger.info(f"[Apple Music] Cached result for {url}")
 
     return result
 
@@ -680,15 +717,63 @@ def _fetch_with_playwright(url: str) -> str:
     except Exception as e:
         raise RuntimeError("Playwright is not installed or cannot be imported: %s" % e)
 
+    logger.info(f"[Playwright] Starting fetch for: {url}")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
             try:
-                page = browser.new_page()
-                page.goto(url, wait_until="networkidle", timeout=20000)
-                # give extra time for dynamic content
-                page.wait_for_timeout(500)
-                content = page.content()
+                # Use a realistic desktop UA and Japanese locale to match Apple Music JP
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    locale="ja-JP",
+                    viewport={"width": 1920, "height": 1080},
+                )
+                page = context.new_page()
+                page.set_default_navigation_timeout(90000)
+                page.set_default_timeout(90000)
+
+                # Enhanced retry to handle Apple Music's SPA navigation
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        logger.info(f"[Playwright] Attempt {attempt + 1}/3 for {url}")
+                        page.goto(url, wait_until="networkidle", timeout=60000)
+                        
+                        # Wait for main content area; Apple Music pages render under <main>
+                        page.wait_for_selector("main", timeout=30000)
+                        logger.info(f"[Playwright] Main content loaded")
+                        
+                        # Wait for track list to render (multiple possible selectors)
+                        page.wait_for_selector(
+                            'div[role="row"], ol li, .songs-list-row',
+                            timeout=30000
+                        )
+                        logger.info(f"[Playwright] Track list rendered")
+                        
+                        # Give extra time for all dynamic content to settle
+                        page.wait_for_timeout(2000)
+                        
+                        content = page.content()
+                        logger.info(f"[Playwright] Successfully fetched {len(content)} bytes")
+                        break
+                    except Exception as nav_err:
+                        last_error = nav_err
+                        logger.warning(f"[Playwright] Attempt {attempt + 1} failed: {nav_err}")
+                        if attempt < 2:  # Not the last attempt
+                            logger.info(f"[Playwright] Waiting before retry...")
+                            page.wait_for_timeout(2000)
+                else:
+                    raise last_error
             finally:
                 try:
                     browser.close()
@@ -714,6 +799,65 @@ def _fetch_with_playwright(url: str) -> str:
             )
         else:
             raise RuntimeError(f"Failed to fetch page with Playwright: {error_msg}")
+
+
+# --- ISRC enrichment helpers ---
+def _mb_search_recording(title: str, artist: str, album: str | None = None) -> dict | None:
+    import requests
+    from urllib.parse import quote
+
+    query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
+    if album:
+        query_parts.append(f'release:"{album}"')
+    query = " AND ".join(query_parts)
+    url = f"https://musicbrainz.org/ws/2/recording?query={quote(query)}&fmt=json&limit=3"
+    try:
+        res = requests.get(url, headers={"User-Agent": "spotify-shopper/1.0 (ISRC enrichment)"}, timeout=10)
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        recordings = data.get("recordings", [])
+        for rec in recordings:
+            isrcs = rec.get("isrcs", [])
+            if isrcs:
+                return {"isrc": isrcs[0]}
+        return None
+    except Exception:
+        return None
+
+
+def enrich_isrc_for_items(items: list, limit: int | None = None) -> int:
+    """Fill missing ISRCs in-place for items with track metadata using MusicBrainz.
+
+    Returns number of items updated.
+    """
+    updated = 0
+    count = 0
+    for it in items:
+        if limit is not None and count >= limit:
+            break
+        track = it.get("track") or {}
+        isrc = track.get("isrc") or track.get("external_ids", {}).get("isrc")
+        if isrc:
+            continue
+        title = track.get("name") or track.get("title")
+        album = (track.get("album") or {}).get("name") if isinstance(track.get("album"), dict) else track.get("album")
+        artists = track.get("artists") or []
+        artist_name = None
+        if isinstance(artists, list) and artists:
+            a0 = artists[0]
+            artist_name = a0.get("name") if isinstance(a0, dict) else a0
+        if not title or not artist_name:
+            continue
+        mb = _mb_search_recording(title, artist_name, album)
+        if mb and mb.get("isrc"):
+            track.setdefault("external_ids", {})
+            track["external_ids"]["isrc"] = mb["isrc"]
+            track["isrc"] = mb["isrc"]
+            it["track"] = track
+            updated += 1
+        count += 1
+    return updated
 
 
 def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
