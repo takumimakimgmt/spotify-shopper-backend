@@ -36,8 +36,6 @@ services:
       - key: SPOTIFY_MARKET
         value: JP,US,GB
       - key: ALLOWED_ORIGINS
-        # Set to your Vercel domain(s), comma-separated. Example:
-        # value: https://your-app.vercel.app,https://www.yourdomain.com
-        sync: false
+          value: https://playlist-shopper.vercel.app,http://localhost:3000,http://127.0.0.1:3000
     healthCheckPath: /health
     autoDeploy: true

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple, List
 from difflib import SequenceMatcher
+from cachetools import TTLCache
+
+import hashlib
+import os
 
 
 # =========================
@@ -141,11 +145,26 @@ class RekordboxLibrary:
 # XML ロード
 # =========================
 
+# In-memory cache for parsed Rekordbox libraries (TTL: 10 minutes)
+_rekordbox_cache: TTLCache = TTLCache(maxsize=10, ttl=600)
+
+
+def _get_file_hash(path: Path) -> str:
+    """Use file size and mtime as a cheap cache key"""
+    stat = path.stat()
+    return f"{stat.st_size}_{stat.st_mtime_ns}"
+
 
 def load_rekordbox_library_xml(path: str | Path) -> RekordboxLibrary:
     path = Path(path).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"Rekordbox XML not found: {path}")
+
+    # Cache lookup
+    cache_key = _get_file_hash(path)
+    cached = _rekordbox_cache.get(cache_key)
+    if cached:
+        return cached
 
     tree = ET.parse(path)
     root = tree.getroot()
@@ -197,12 +216,17 @@ def load_rekordbox_library_xml(path: str | Path) -> RekordboxLibrary:
             key2 = (title_norm, album_norm)
             by_title_album.setdefault(key2, []).append(info)
 
-    return RekordboxLibrary(
+    library = RekordboxLibrary(
         by_isrc=by_isrc,
         by_title_artist=by_title_artist,
         by_artist_norm=by_artist_norm,
         by_title_album=by_title_album,
     )
+
+    # Cache the parsed library
+    _rekordbox_cache[cache_key] = library
+
+    return library
 
 
 # =========================
