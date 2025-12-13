@@ -535,6 +535,7 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "links": links,
                 "track_key_primary": track_key_primary or track_key_fallback,
                 "track_key_fallback": track_key_fallback,
+                "track_key_version": "v1",  # Allows future migrations of normalization logic
             }
         )
 
