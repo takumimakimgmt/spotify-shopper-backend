@@ -419,14 +419,22 @@ def _generate_track_key_primary(isrc: str | None) -> str | None:
 
 
 def _generate_track_key_fallback(title: str, artist: str, album: str | None = None) -> str:
-    """Generate fallback track key using normalized fields"""
+    """Generate fallback track key using normalized fields.
+    
+    Escapes pipe and backslash characters to prevent delimiter collision.
+    Safe to split by '|' for reconstruction.
+    """
     from rekordbox import normalize_title_base, normalize_artist, normalize_album
     
-    t_norm = normalize_title_base(title)
-    a_norm = normalize_artist(artist)
-    alb_norm = normalize_album(album or "")
+    def _sanitize_field(s: str) -> str:
+        """Escape delimiter characters for track_key safety"""
+        return s.replace("\\", "＼").replace("|", "／")
     
-    # Deterministic key for Buylist state matching
+    t_norm = _sanitize_field(normalize_title_base(title))
+    a_norm = _sanitize_field(normalize_artist(artist))
+    alb_norm = _sanitize_field(normalize_album(album or ""))
+    
+    # Deterministic key for Buylist state matching (pipe-delimited, fields escaped)
     if alb_norm:
         return f"norm:{t_norm}|{a_norm}|{alb_norm}"
     else:
