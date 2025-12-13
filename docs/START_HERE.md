@@ -1,63 +1,51 @@
-# P1.0 Performance Metrics - Start Here
+# P1.0 / P1.1 Performance Metrics - Start Here
 
-## 📊 何が入ったのか？
+## 📊 Phase P1.0: 計測機能の実装（完了）
 
-フロント・バックエンド両側に **詳細な性能計測機能** を実装しました。
+フロント・バックエンド両側に **詳細な性能計測機能** を実装。
 
 - **フロント**: Network / JSON parse / React rendering の時間を計測
 - **バック**: Playlist取得 / ISRC enrichment / Rekordbox照合 の時間を計測
 
-**目的:** 「初回解析が長い」という課題を **推測ではなく実測で改善する**
+---
+
+## 🎯 Phase P1.1: ボトルネック特定 & 改善実装（進行中）
+
+### Step 1: テスト実行
+
+1. **QUICK_RUN.md** を読む（10分のテスト手順）
+2. cold/warm run を3回実行
+3. `[PERF]` ログを **PERF_RESULTS.md** に記入
+
+### Step 2: 分析
+
+1. PERF_RESULTS.md の結果を見て、何が支配的かを判定
+2. **P1.1_IMPLEMENTATION_GUIDE.md** で対応する改善案を確認
+
+### Step 3: 改善実装（オプション）
+
+ボトルネック別に最小改善を実装
+- Case A: TTL キャッシュ（network_ms が支配）
+- Case B: React 最適化（render_ms が支配）
+- Case C: マッチング最適化（xml_ms が支配）
 
 ---
 
-## 🎯 今すぐやること（5分）
+## 📖 ドキュメント構成
 
-### 1. セットアップして計測ログを集める
+**P1.0 計測:**
+- TEST_CHECKLIST.md - テスト実行手順（5分版）
+- PERF_TESTING.md - 詳細テストガイド
+- P1.0_IMPLEMENTATION.md - 計測コードの説明
 
-```bash
-# ターミナル1: バックエンド
-cd /Users/takumimaki/dev/spotify-shopper
-PYTHONPATH=/Users/takumimaki/dev/spotify-shopper \
-  /Users/takumimaki/dev/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
-
-# ターミナル2: フロント
-cd /Users/takumimaki/dev/spotify-shopper-web
-NEXT_PUBLIC_BACKEND_URL="http://127.0.0.1:8000" npm run dev
-
-# ブラウザ: http://localhost:3000 → DevTools Console (F12)
-```
-
-### 2. Spotify プレイリスト URL で解析（cold run）
-
-URL例:
-```
-https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsrlZ
-```
-
-→ Console に `[PERF] url=... tracks=... network_ms=... json_ms=... render_ms=...` が出る
-
-### 3. 同じ URL で もう1回（warm run）
-
-→ ログを比較
+**P1.1 改善:**
+- QUICK_RUN.md - 実行手順（10分）
+- PERF_RESULTS.md - テスト結果テンプレート
+- P1.1_IMPLEMENTATION_GUIDE.md - 改善案とコード例
 
 ---
 
-## 📖 ドキュメント
-
-| ファイル | 内容 | 用途 |
-|---------|------|------|
-| **TEST_CHECKLIST.md** | テスト実行手順 | 5分で cold/warm run を実行 |
-| **PERF_TESTING.md** | 詳細テスト＆解釈ガイド | ボトルネック診断 |
-| **P1.0_IMPLEMENTATION.md** | 実装の詳細 | 計測コードの説明 |
-
----
-
-## 🔍 ボトルネック判定（実行後）
-
-ログを見て、どこが遅いか判定：
-
-```
+**👉 次: QUICK_RUN.md を読んでテストを実行してください！**
 network_ms > 1000ms ?
   → Spotify/Apple fetch 遅い
   → 対策: TTL キャッシュ（6-24h）
