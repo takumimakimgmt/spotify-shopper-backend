@@ -165,6 +165,7 @@ def get_playlist(
     source: str = Query("spotify", description="spotify or apple"),
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
     isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
+    refresh: Optional[int] = Query(None, description="Bypass cache when set to 1"),
 ):
     """
     プレイリストだけを取得（Rekordbox 突き合わせなし）。
@@ -183,10 +184,11 @@ def get_playlist(
 
     # Call core directly so we can attach debug info on failure
     try:
-        # Cache lookup
+        # Cache lookup (allow bypass via refresh=1)
         cache_key = f"{src}:{normalized_url}"
-        cached = PLAYLIST_CACHE.get(cache_key)
-        cache_hit = cached is not None
+        bypass = (refresh == 1)
+        cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
+        cache_hit = (cached is not None)
         if cached is not None:
             result = cached
         else:
@@ -213,14 +215,14 @@ def get_playlist(
         tracks_count = len(data.get('tracks', []))
         # Cache store (only successful non-empty)
         try:
-            if not cache_hit and not result.get("error") and len(data.get("tracks", [])) > 0:
+            if not bypass and not cache_hit and not result.get("error") and len(data.get("tracks", [])) > 0:
                 PLAYLIST_CACHE[cache_key] = result
         except Exception:
             pass
 
         logger.info(
             f"[PERF] source={src} url_len={len(clean_url)} normalized_url_len={len(normalized_url)} "
-            f"cache_hit={'true' if cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} "
+            f"cache_hit={'true' if cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} cache_size={len(PLAYLIST_CACHE)} refresh={'1' if bypass else '0'} "
             f"fetch_ms={perf.get('fetch_ms', 0):.1f} enrich_ms={perf.get('enrich_ms', 0):.1f} "
             f"total_backend_ms={perf.get('total_ms', 0):.1f} total_api_ms={total_ms:.1f} tracks={tracks_count}"
         )
@@ -373,6 +375,7 @@ async def playlist_with_rekordbox_upload(
     url: str = Form(..., description="Playlist URL or ID or URL"),
     source: str = Form("spotify", description="spotify or apple"),
     file: UploadFile | None = File(None, description="Rekordbox collection XML"),
+    refresh: Optional[int] = Form(None, description="Bypass cache when set to 1"),
 ):
     """
     フロントからの XML ファイルアップロード版。
@@ -396,7 +399,8 @@ async def playlist_with_rekordbox_upload(
     try:
         t0_fetch = time.time()
         cache_key = f"{src}:{normalized_url}"
-        cached = PLAYLIST_CACHE.get(cache_key)
+        bypass = (refresh == 1)
+        cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
         cache_hit = cached is not None
         if cached is not None:
             result = cached
@@ -409,7 +413,7 @@ async def playlist_with_rekordbox_upload(
 
         # Store base playlist in cache (no XML-specific flags)
         try:
-            if not cache_hit and not result.get("error") and len(playlist_data.get("tracks", [])) > 0:
+            if not bypass and not cache_hit and not result.get("error") and len(playlist_data.get("tracks", [])) > 0:
                 PLAYLIST_CACHE[cache_key] = result
         except Exception:
             pass
@@ -464,7 +468,7 @@ async def playlist_with_rekordbox_upload(
     tracks_count = len(playlist_with_owned.get('tracks', []))
     logger.info(
         f"[PERF] source={src} url_len={len(clean_url)} normalized_url_len={len(normalized_url)} "
-        f"cache_hit={'true' if 'cache_hit' in locals() and cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} "
+        f"cache_hit={'true' if 'cache_hit' in locals() and cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} cache_size={len(PLAYLIST_CACHE)} refresh={'1' if (refresh == 1) else '0'} "
         f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} tracks={tracks_count}"
     )
     
