@@ -162,6 +162,9 @@ def get_playlist(
     """
     プレイリストだけを取得（Rekordbox 突き合わせなし）。
     """
+    import time
+    t0_total = time.time()
+    
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
     clean_url = _sanitize_url(url)
     src = (source or "spotify").lower()
@@ -173,6 +176,8 @@ def get_playlist(
     # Call core directly so we can attach debug info on failure
     try:
         result = fetch_playlist_tracks_generic(src, clean_url)
+        perf = result.get('perf', {})
+        
         # Optional ISRC enrichment (best-effort)
         if enrich_isrc and isinstance(result, dict):
             try:
@@ -184,7 +189,22 @@ def get_playlist(
             except Exception as _:
                 # ignore enrichment errors
                 pass
+        
         data = playlist_result_to_dict(result)
+        
+        # Log performance metrics
+        t1_total = time.time()
+        total_ms = (t1_total - t0_total) * 1000
+        tracks_count = len(data.get('tracks', []))
+        logger.info(
+            f"[PERF] source={src} url_len={len(clean_url)} "
+            f"fetch_ms={perf.get('fetch_ms', 0):.1f} "
+            f"enrich_ms={perf.get('enrich_ms', 0):.1f} "
+            f"total_backend_ms={perf.get('total_ms', 0):.1f} "
+            f"total_api_ms={total_ms:.1f} "
+            f"tracks={tracks_count}"
+        )
+        
         return data
     except Exception as e:
         logger.error(f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e}")
@@ -339,6 +359,9 @@ async def playlist_with_rekordbox_upload(
     - フロントは multipart/form-data で url と file を送る。
     - アップロードされた XML を一時ファイルに保存し、Rekordbox 突き合わせ。
     """
+    import time
+    t0_total = time.time()
+    
     # file は任意。ある場合は後で content-type とサイズ検証を行う。
 
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
@@ -350,7 +373,11 @@ async def playlist_with_rekordbox_upload(
     logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
 
     try:
+        t0_fetch = time.time()
         result = fetch_playlist_tracks_generic(src, clean_url)
+        t1_fetch = time.time()
+        fetch_ms = (t1_fetch - t0_fetch) * 1000
+        
         playlist_data = playlist_result_to_dict(result)
     except Exception as e:
         logger.error(f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e}")
@@ -358,6 +385,8 @@ async def playlist_with_rekordbox_upload(
 
     # 一時ファイルに XML を書き出し
     playlist_with_owned = playlist_data
+    xml_ms = 0
+    total_ms = 0
 
     # file がある場合だけ Rekordbox 照合を行う
     if file is not None:
@@ -377,6 +406,7 @@ async def playlist_with_rekordbox_upload(
 
         tmp_path = None
         try:
+            t0_xml = time.time()
             with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
                 tmp.write(contents)
                 tmp_path = tmp.name
@@ -385,6 +415,8 @@ async def playlist_with_rekordbox_upload(
                 playlist_data,
                 tmp_path,
             )
+            t1_xml = time.time()
+            xml_ms = (t1_xml - t0_xml) * 1000
         finally:
             # 後始末
             if tmp_path and os.path.exists(tmp_path):
@@ -393,6 +425,15 @@ async def playlist_with_rekordbox_upload(
                 except OSError:
                     pass
 
+    t1_total = time.time()
+    total_ms = (t1_total - t0_total) * 1000
+    tracks_count = len(playlist_with_owned.get('tracks', []))
+    logger.info(
+        f"[PERF] source={src} url_len={len(clean_url)} "
+        f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} "
+        f"tracks={tracks_count}"
+    )
+    
     return playlist_with_owned
 
 

@@ -957,12 +957,44 @@ def fetch_playlist_tracks_generic(source: str, url_or_id: str) -> Dict[str, Any]
     """
     Dispatch between spotify/apple sources. Default to spotify for compatibility.
     For Apple Music, enriches tracks with Spotify metadata (artist, album, ISRC).
+    Returns dict with 'perf' key containing timing metrics.
     """
+    import time
+    t0_total = time.time()
+    
     src = (source or "spotify").lower()
+    perf = {
+        'fetch_ms': 0,
+        'enrich_ms': 0,
+        'total_ms': 0,
+        'tracks_count': 0,
+    }
+    
     if src == "apple":
+        t0_fetch = time.time()
         result = fetch_apple_playlist_tracks_from_web(url_or_id)
+        t1_fetch = time.time()
+        perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
+        
         # Enrich Apple tracks with Spotify metadata
+        t0_enrich = time.time()
         result = _enrich_apple_tracks_with_spotify(result)
+        t1_enrich = time.time()
+        perf['enrich_ms'] = (t1_enrich - t0_enrich) * 1000
+        
+        result['perf'] = perf
+        t1_total = time.time()
+        perf['total_ms'] = (t1_total - t0_total) * 1000
+        perf['tracks_count'] = len(result.get('items', []))
         return result
     else:
-        return fetch_playlist_tracks(url_or_id)
+        t0_fetch = time.time()
+        result = fetch_playlist_tracks(url_or_id)
+        t1_fetch = time.time()
+        perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
+        
+        result['perf'] = perf
+        t1_total = time.time()
+        perf['total_ms'] = (t1_total - t0_fetch) * 1000
+        perf['tracks_count'] = len(result.get('items', []))
+        return result
