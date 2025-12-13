@@ -15,7 +15,14 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core import fetch_playlist_tracks_generic, playlist_result_to_dict, enrich_isrc_for_items
+from core import (
+    fetch_playlist_tracks_generic,
+    playlist_result_to_dict,
+    enrich_isrc_for_items,
+    normalize_playlist_url,
+)
+from core import _PLAYLIST_CACHE as PLAYLIST_CACHE  # TTLCache
+from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
 from rekordbox import mark_owned_tracks
 import logging
 import json
@@ -167,15 +174,23 @@ def get_playlist(
     
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
     clean_url = _sanitize_url(url)
+    normalized_url = normalize_playlist_url(clean_url)
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
         src = "apple"
 
-    logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
+    logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} -> using source={src}")
 
     # Call core directly so we can attach debug info on failure
     try:
-        result = fetch_playlist_tracks_generic(src, clean_url)
+        # Cache lookup
+        cache_key = f"{src}:{normalized_url}"
+        cached = PLAYLIST_CACHE.get(cache_key)
+        cache_hit = cached is not None
+        if cached is not None:
+            result = cached
+        else:
+            result = fetch_playlist_tracks_generic(src, clean_url)
         perf = result.get('perf', {})
         
         # Optional ISRC enrichment (best-effort)
@@ -196,13 +211,18 @@ def get_playlist(
         t1_total = time.time()
         total_ms = (t1_total - t0_total) * 1000
         tracks_count = len(data.get('tracks', []))
+        # Cache store (only successful non-empty)
+        try:
+            if not cache_hit and not result.get("error") and len(data.get("tracks", [])) > 0:
+                PLAYLIST_CACHE[cache_key] = result
+        except Exception:
+            pass
+
         logger.info(
-            f"[PERF] source={src} url_len={len(clean_url)} "
-            f"fetch_ms={perf.get('fetch_ms', 0):.1f} "
-            f"enrich_ms={perf.get('enrich_ms', 0):.1f} "
-            f"total_backend_ms={perf.get('total_ms', 0):.1f} "
-            f"total_api_ms={total_ms:.1f} "
-            f"tracks={tracks_count}"
+            f"[PERF] source={src} url_len={len(clean_url)} normalized_url_len={len(normalized_url)} "
+            f"cache_hit={'true' if cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} "
+            f"fetch_ms={perf.get('fetch_ms', 0):.1f} enrich_ms={perf.get('enrich_ms', 0):.1f} "
+            f"total_backend_ms={perf.get('total_ms', 0):.1f} total_api_ms={total_ms:.1f} tracks={tracks_count}"
         )
         
         return data
@@ -366,19 +386,33 @@ async def playlist_with_rekordbox_upload(
 
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
     clean_url = _sanitize_url(url)
+    normalized_url = normalize_playlist_url(clean_url)
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
         src = "apple"
 
-    logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} source_param={source} -> using source={src}")
+    logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} -> using source={src}")
 
     try:
         t0_fetch = time.time()
-        result = fetch_playlist_tracks_generic(src, clean_url)
+        cache_key = f"{src}:{normalized_url}"
+        cached = PLAYLIST_CACHE.get(cache_key)
+        cache_hit = cached is not None
+        if cached is not None:
+            result = cached
+        else:
+            result = fetch_playlist_tracks_generic(src, clean_url)
         t1_fetch = time.time()
         fetch_ms = (t1_fetch - t0_fetch) * 1000
         
         playlist_data = playlist_result_to_dict(result)
+
+        # Store base playlist in cache (no XML-specific flags)
+        try:
+            if not cache_hit and not result.get("error") and len(playlist_data.get("tracks", [])) > 0:
+                PLAYLIST_CACHE[cache_key] = result
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e}")
         raise HTTPException(status_code=400, detail={"error": str(e), "used_source": src, "url": clean_url})
@@ -429,9 +463,9 @@ async def playlist_with_rekordbox_upload(
     total_ms = (t1_total - t0_total) * 1000
     tracks_count = len(playlist_with_owned.get('tracks', []))
     logger.info(
-        f"[PERF] source={src} url_len={len(clean_url)} "
-        f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} "
-        f"tracks={tracks_count}"
+        f"[PERF] source={src} url_len={len(clean_url)} normalized_url_len={len(normalized_url)} "
+        f"cache_hit={'true' if 'cache_hit' in locals() and cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} "
+        f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} tracks={tracks_count}"
     )
     
     return playlist_with_owned

@@ -22,6 +22,46 @@ from bs4 import BeautifulSoup
 import json
 import time
 from cachetools import TTLCache
+import os
+from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
+
+# Global TTL cache for playlist fetch results
+_ENV = os.getenv("ENV", "prod").lower()
+_TTL_SECONDS = 3600 if _ENV == "dev" else 21600  # dev:1h, prod:6h
+_PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=_TTL_SECONDS)
+
+def normalize_playlist_url(url: str) -> str:
+    """Normalize playlist URL for canonical cache key.
+    - Strip tracking query params: si, utm_*, fbclid, gclid
+    - Ensure trailing slash consistency
+    - For Spotify playlist URLs, canonicalize to open.spotify.com/playlist/<id>
+    """
+    try:
+        s = (url or "").strip()
+        if not s:
+            return ""
+        parsed = urlparse(s)
+        q = {k: v for k, v in parse_qsl(parsed.query) if not (k == "si" or k == "fbclid" or k == "gclid" or k.startswith("utm_"))}
+        new_query = urlencode(q)
+        path = parsed.path or ""
+        # Spotify canonicalization
+        if "open.spotify.com" in (parsed.netloc or "") and "/playlist/" in path:
+            parts = path.split("/")
+            # ['', 'playlist', '<id>', ...]
+            try:
+                idx = parts.index("playlist")
+                sp_id = parts[idx + 1]
+                path = f"/playlist/{sp_id}"
+            except Exception:
+                pass
+        # Ensure no trailing stuff beyond canonical path and unify trailing slash removal
+        if path.endswith("/"):
+            path = path[:-1]
+        normalized = urlunparse((parsed.scheme or "https", parsed.netloc or "", path, "", new_query, ""))
+        return normalized
+    except Exception:
+        return url
+
 import unicodedata
 
 import spotipy
