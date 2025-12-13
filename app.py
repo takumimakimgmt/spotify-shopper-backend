@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from core import fetch_playlist_tracks_generic, playlist_result_to_dict, enrich_isrc_for_items
 from rekordbox import mark_owned_tracks
 import logging
+import json
 
 # Basic logging configuration to ensure logger outputs appear in the terminal
 logging.basicConfig(level=logging.INFO)
@@ -212,6 +213,120 @@ def playlist_with_rekordbox(body: PlaylistWithRekordboxBody):
     )
     return playlist_with_owned
 
+
+@app.post("/api/match-snapshot-with-xml")
+async def match_snapshot_with_xml(
+    snapshot: str = Form(..., description="PlaylistSnapshotV1 JSON string"),
+    file: UploadFile | None = File(..., description="Rekordbox collection XML"),
+):
+    """
+    与えられた PlaylistSnapshotV1（JSON）に対して、Rekordbox XML を用いて owned/owned_reason を付与して返す。
+    URL の再入力は不要。
+
+    制限：
+    - snapshot: 最大 1MB
+    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 5MB）
+    """
+    # サイズチェック（snapshot 文字列長）
+    if snapshot is None:
+        raise HTTPException(status_code=400, detail="snapshot は必須です")
+    if len(snapshot.encode("utf-8")) > 1 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="snapshot のサイズが上限(1MB)を超えています")
+
+    # JSON パース
+    try:
+        snap = json.loads(snapshot)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"snapshot JSON のパースに失敗: {e}")
+
+    # 簡易スキーマ検証
+    if not isinstance(snap, dict):
+        raise HTTPException(status_code=400, detail="snapshot は JSON オブジェクトである必要があります")
+    if snap.get("schema") != "playlist_snapshot":
+        raise HTTPException(status_code=400, detail="snapshot.schema は 'playlist_snapshot' である必要があります")
+    if snap.get("version") != 1:
+        raise HTTPException(status_code=400, detail="snapshot.version は 1 である必要があります")
+    if "tracks" not in snap or not isinstance(snap["tracks"], list):
+        raise HTTPException(status_code=400, detail="snapshot.tracks は配列である必要があります")
+
+    # XML ファイル必須＆検証
+    if file is None:
+        raise HTTPException(status_code=400, detail="XML ファイルを 'file' フィールドで送信してください")
+    if file.content_type not in ("text/xml", "application/xml", "text/plain"):
+        raise HTTPException(status_code=400, detail="XML ファイルをアップロードしてください")
+
+    try:
+        xml_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"XML 読み込みに失敗しました: {e}")
+
+    if not xml_bytes:
+        raise HTTPException(status_code=400, detail="空の XML ファイルです")
+    if len(xml_bytes) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail=f"XML が大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）")
+
+    # 既存の mark_owned_tracks は playlist 型（/api/playlist の返却）を期待するため、
+    # snapshot から近い構造に組み替えて owned 判定を実行し、結果を snapshot に反映する。
+    # playlist_result_to_dict の形に合わせる：
+    playlist_like: Dict[str, Any] = {
+        "playlist_id": snap.get("playlist", {}).get("id") or "snapshot",
+        "playlist_name": snap.get("playlist", {}).get("name") or "Snapshot",
+        "playlist_url": snap.get("playlist", {}).get("url"),
+        "tracks": [
+            {
+                "title": t.get("title"),
+                "artist": t.get("artist"),
+                "album": t.get("album"),
+                "isrc": t.get("isrc"),
+                # URL フィールド名差異を吸収（あれば）
+                "spotify_url": t.get("links", {}).get("spotify"),
+                "apple_url": t.get("links", {}).get("apple"),
+                # 既存キーもそのまま運ぶ
+                "track_key_primary": t.get("track_key_primary"),
+                "track_key_fallback": t.get("track_key_fallback"),
+                "track_key_primary_type": t.get("track_key_primary_type", "norm"),
+                "track_key_version": t.get("track_key_version", "v1"),
+            }
+            for t in snap.get("tracks", [])
+        ],
+    }
+
+    # XML を一時ファイルへ書き出して照合
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+            tmp.write(xml_bytes)
+            tmp_path = tmp.name
+
+        matched = _apply_rekordbox_owned_flags(playlist_like, tmp_path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    # matched.tracks には owned/owned_reason が入っている想定。
+    matched_tracks: List[Dict[str, Any]] = matched.get("tracks", [])
+    # track_key_primary を使って対応付けし、snap.tracks を更新
+    index_by_key: Dict[str, Dict[str, Any]] = {}
+    for mt in matched_tracks:
+        key = mt.get("track_key_primary") or mt.get("track_key_fallback")
+        if key:
+            index_by_key[key] = mt
+
+    updated_tracks: List[Dict[str, Any]] = []
+    for t in snap.get("tracks", []):
+        key = t.get("track_key_primary") or t.get("track_key_fallback")
+        mt = index_by_key.get(key)
+        if mt:
+            t["owned"] = mt.get("owned")
+            t["owned_reason"] = mt.get("owned_reason")
+        updated_tracks.append(t)
+
+    snap["tracks"] = updated_tracks
+    # 返却：PlaylistSnapshotV1（入力を更新したもの）
+    return snap
 
 @app.post("/api/playlist-with-rekordbox-upload", response_model=PlaylistResponse)
 async def playlist_with_rekordbox_upload(
