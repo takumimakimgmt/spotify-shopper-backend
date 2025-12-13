@@ -411,6 +411,28 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
 # =========================
 
 
+def _generate_track_key_primary(isrc: str | None) -> str | None:
+    """Generate primary track key based on ISRC (server-determined for state sync)"""
+    if isrc and isrc.strip():
+        return f"isrc:{isrc.upper()}"
+    return None
+
+
+def _generate_track_key_fallback(title: str, artist: str, album: str | None = None) -> str:
+    """Generate fallback track key using normalized fields"""
+    from rekordbox import normalize_title_base, normalize_artist, normalize_album
+    
+    t_norm = normalize_title_base(title)
+    a_norm = normalize_artist(artist)
+    alb_norm = normalize_album(album or "")
+    
+    # Deterministic key for Buylist state matching
+    if alb_norm:
+        return f"norm:{t_norm}|{a_norm}|{alb_norm}"
+    else:
+        return f"norm:{t_norm}|{a_norm}"
+
+
 def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     fetch_playlist_tracks() の結果（raw dict）を、
@@ -497,6 +519,10 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         isrc = (track.get("external_ids") or {}).get("isrc")  # ISRC from Spotify
 
         links = build_store_links(title, artist_name, album_name, isrc=isrc)
+        
+        # Generate deterministic track keys for Buylist state management
+        track_key_primary = _generate_track_key_primary(isrc)
+        track_key_fallback = _generate_track_key_fallback(title, artist_name, album_name)
 
         tracks_out.append(
             {
@@ -507,6 +533,8 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "spotify_url": spotify_url,
                 "apple_url": apple_url,
                 "links": links,
+                "track_key_primary": track_key_primary or track_key_fallback,
+                "track_key_fallback": track_key_fallback,
             }
         )
 

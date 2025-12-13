@@ -45,6 +45,8 @@ class TrackModel(BaseModel):
     links: Optional[StoreLinksModel] = None
     owned: Optional[bool] = None
     owned_reason: Optional[str] = None
+    track_key_primary: Optional[str] = None  # ISRC-based or fallback (server-determined for state sync)
+    track_key_fallback: Optional[str] = None  # normalized(title+artist+album) backup
 
 
 class PlaylistResponse(BaseModel):
