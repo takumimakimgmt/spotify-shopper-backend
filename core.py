@@ -523,6 +523,10 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         # Generate deterministic track keys for Buylist state management
         track_key_primary = _generate_track_key_primary(isrc)
         track_key_fallback = _generate_track_key_fallback(title, artist_name, album_name)
+        
+        # Determine primary type: ISRC takes precedence, else fallback
+        track_key_primary_type = "isrc" if track_key_primary and track_key_primary.startswith("isrc:") else "norm"
+        final_primary = track_key_primary or track_key_fallback
 
         tracks_out.append(
             {
@@ -533,8 +537,9 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "spotify_url": spotify_url,
                 "apple_url": apple_url,
                 "links": links,
-                "track_key_primary": track_key_primary or track_key_fallback,
+                "track_key_primary": final_primary,
                 "track_key_fallback": track_key_fallback,
+                "track_key_primary_type": track_key_primary_type,  # UI hint: "isrc" → confident, "norm" → ambiguous
                 "track_key_version": "v1",  # Allows future migrations of normalization logic
             }
         )

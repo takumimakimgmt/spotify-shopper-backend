@@ -47,6 +47,7 @@ class TrackModel(BaseModel):
     owned_reason: Optional[str] = None
     track_key_primary: Optional[str] = None  # ISRC-based or fallback (server-determined for state sync)
     track_key_fallback: Optional[str] = None  # normalized(title+artist+album) backup
+    track_key_primary_type: str = "norm"  # "isrc" | "norm" (UI hint: isrc=confident, norm=ambiguous)
     track_key_version: str = "v1"  # version for future-proof migrations (normalize rules evolution)
 
 

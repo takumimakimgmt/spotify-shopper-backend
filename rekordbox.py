@@ -24,6 +24,7 @@ def normalize_artist(name: str) -> str:
     - カンマ / & / ' and ' で区切って先頭だけ代表にする
     - feat. / ft. / featuring 以降を削る
     - 余分なスペースを詰める
+    - 区切り文字 | をエスケープ（track_key_fallback用）
     """
     s = (name or "").lower().strip()
 
@@ -36,6 +37,8 @@ def normalize_artist(name: str) -> str:
     s = re.split(r"\s+(feat\.|ft\.|featuring)\s+", s)[0]
 
     s = re.sub(r"\s+", " ", s).strip()
+    # Escape pipe delimiter for track_key reconstruction
+    s = s.replace("|", "／")
     return s
 
 
@@ -47,6 +50,7 @@ def normalize_title_base(title: str) -> str:
     - feat. / ft. / featuring 以降を削る
     - 末尾の " - original mix" 系を削る
     - 余分なスペースを詰める
+    - 区切り文字 | をエスケープ（track_key_fallback用）
     """
     s = (title or "").lower().strip()
 
@@ -65,6 +69,8 @@ def normalize_title_base(title: str) -> str:
     )
 
     s = re.sub(r"\s+", " ", s).strip()
+    # Escape pipe delimiter for track_key reconstruction
+    s = s.replace("|", "／")
     return s
 
 
@@ -74,11 +80,14 @@ def normalize_album(album: str) -> str:
     - 小文字化
     - () / [] 内の注釈（deluxe, extended など）を削る
     - 余分なスペースを詰める
+    - 区切り文字 | をエスケープ（track_key_fallback用）
     """
     s = (album or "").lower().strip()
     s = re.sub(r"\([^)]*\)", "", s)
     s = re.sub(r"\[[^]]*\]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
+    # Escape pipe delimiter for track_key reconstruction
+    s = s.replace("|", "／")
     return s
 
 
