@@ -710,6 +710,8 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     api_response_captured: Dict[str, Any] | None = None
     api_candidates: list[dict] = []
     response_candidates: list[dict] = []
+    xhr_fetch_requests: list[dict] = []
+    json_responses_any_domain: list[dict] = []
     request_candidates: list[dict] = []
 
     async def on_response_handler(response):
@@ -722,6 +724,10 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             if any(host in url_str for host in ["music.apple.com", "amp-api.music.apple.com"]):
                 if len(response_candidates) < 20:
                     response_candidates.append({"url": url_str, "status": status, "content_type": ct})
+            # Record any JSON responses regardless of domain (diagnostics)
+            if "application/json" in (ct or "").lower():
+                if len(json_responses_any_domain) < 20:
+                    json_responses_any_domain.append({"url": url_str, "status": status, "content_type": ct})
             # Match broader Apple Music API patterns (amp-api, music.apple.com)
             match_api = False
             if "/v1/catalog/" in url_str and "/playlists" in url_str:
@@ -759,6 +765,14 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             if any(host in url_str for host in ["music.apple.com", "amp-api.music.apple.com"]):
                 if len(request_candidates) < 20:
                     request_candidates.append({
+                        "url": url_str,
+                        "method": request.method,
+                        "resourceType": request.resource_type,
+                    })
+            # Always record xhr/fetch requests separately (diagnostics)
+            if request.resource_type in ("xhr", "fetch"):
+                if len(xhr_fetch_requests) < 10:
+                    xhr_fetch_requests.append({
                         "url": url_str,
                         "method": request.method,
                         "resourceType": request.resource_type,
@@ -896,7 +910,15 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         # DOM fallback if API response unavailable
         if result is None:
             try:
-                await page.wait_for_timeout(1000)
+                # Short selector wait for track rows visible in UI (5-8s)
+                try:
+                    await page.wait_for_selector(
+                        'div[role="row"], ol li, .songs-list-row, apple-music-item, .music-item, [data-test-song-row]',
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass
+                await page.wait_for_timeout(500)
                 try:
                     await page.wait_for_selector(
                         'script[id="__NEXT_DATA__"], script[type="application/json"], script[type="application/ld+json"]',
@@ -955,7 +977,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 meta_reason = "blocked_variant"
             elif reason == "no_tracks":
                 # Only mark as unsupported if we have Apple responses but no tracks
-                if response_candidates:
+                if response_candidates or json_responses_any_domain or xhr_fetch_requests:
                     meta_reason = "unsupported_playlist_variant"
                 else:
                     meta_reason = "no_apple_traffic"
@@ -969,6 +991,8 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     "apple_api_candidates": api_candidates[:20],
                     "apple_response_candidates": response_candidates[:20],
                     "apple_request_candidates": request_candidates[:20],
+                    "apple_xhr_fetch_requests": xhr_fetch_requests[:10],
+                    "json_responses_any_domain": json_responses_any_domain[:20],
                 },
             )
 
@@ -982,6 +1006,10 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     result["meta"].setdefault("apple_response_candidates", response_candidates[:20])
                 if request_candidates:
                     result["meta"].setdefault("apple_request_candidates", request_candidates[:20])
+                if xhr_fetch_requests:
+                    result["meta"].setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
+                if json_responses_any_domain:
+                    result["meta"].setdefault("json_responses_any_domain", json_responses_any_domain[:20])
             except Exception:
                 pass
 
