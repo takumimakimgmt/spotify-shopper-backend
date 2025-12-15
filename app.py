@@ -148,7 +148,13 @@ app.add_middleware(
 
 @app.get("/health", tags=["system"])
 def health() -> Dict[str, Any]:
-    return {"ok": True, "status": "ok"}
+    import os
+    return {
+        "ok": True,
+        "status": "ok",
+        "build_commit": os.getenv("RENDER_GIT_COMMIT", "local")[:7],
+        "has_meta": True,  # This build includes meta field support
+    }
 
 
 @app.get("/", tags=["system"])
