@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -11,6 +12,7 @@ from fastapi import (
     UploadFile,
     File,
     Form,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,6 +28,7 @@ from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
 from rekordbox import mark_owned_tracks
 import logging
 import json
+from playwright_pool import close_browser
 
 # Basic logging configuration to ensure logger outputs appear in the terminal
 logging.basicConfig(level=logging.INFO)
@@ -59,11 +62,22 @@ class TrackModel(BaseModel):
     track_key_version: str = "v1"  # version for future-proof migrations (normalize rules evolution)
 
 
+class PlaylistMetaModel(BaseModel):
+    cache_hit: Optional[bool] = None
+    cache_ttl_s: Optional[int] = None
+    refresh: Optional[int] = None
+    fetch_ms: Optional[float] = None
+    enrich_ms: Optional[float] = None
+    total_backend_ms: Optional[float] = None
+    total_api_ms: Optional[float] = None
+
+
 class PlaylistResponse(BaseModel):
     playlist_id: str
     playlist_name: str
     playlist_url: Optional[str] = None
     tracks: List[TrackModel]
+    meta: Optional[PlaylistMetaModel] = None
 
 
 class PlaylistWithRekordboxBody(BaseModel):
@@ -85,6 +99,22 @@ app = FastAPI(
 @app.on_event("startup")
 def _log_startup():
     logger.info("spotify-shopper: startup event triggered")
+
+
+@app.on_event("startup")
+async def _init_playwright_state():
+    # Lazy init: create slots and semaphore only; browser starts on first Apple request
+    app.state.pw = None
+    app.state.browser = None
+    app.state.apple_sem = asyncio.Semaphore(2)
+
+
+@app.on_event("shutdown")
+async def _shutdown_playwright_state():
+    try:
+        await close_browser()
+    except Exception:
+        pass
 
 # 最大アップロードサイズ（バイト） - デフォルト 5MB
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 5 * 1024 * 1024))
@@ -117,8 +147,14 @@ app.add_middleware(
 # =========================
 
 @app.get("/health", tags=["system"])
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health() -> Dict[str, Any]:
+    return {"ok": True, "status": "ok"}
+
+
+@app.get("/", tags=["system"])
+def root() -> Dict[str, Any]:
+    # Render health-style response to silence platform health checks on /
+    return {"ok": True, "status": "ok"}
 
 
 # =========================
@@ -160,7 +196,8 @@ def _apply_rekordbox_owned_flags(
 # =========================
 
 @app.get("/api/playlist", response_model=PlaylistResponse)
-def get_playlist(
+async def get_playlist(
+    request: Request,
     url: str = Query(..., description="Playlist URL or ID or URL"),
     source: str = Query("spotify", description="spotify or apple"),
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
@@ -192,7 +229,7 @@ def get_playlist(
         if cached is not None:
             result = cached
         else:
-            result = fetch_playlist_tracks_generic(src, clean_url)
+            result = await fetch_playlist_tracks_generic(src, clean_url, app=request.app)
         perf = result.get('perf', {})
         
         # Optional ISRC enrichment (best-effort)
@@ -226,7 +263,19 @@ def get_playlist(
             f"fetch_ms={perf.get('fetch_ms', 0):.1f} enrich_ms={perf.get('enrich_ms', 0):.1f} "
             f"total_backend_ms={perf.get('total_ms', 0):.1f} total_api_ms={total_ms:.1f} tracks={tracks_count}"
         )
-        
+
+        meta = {
+            "cache_hit": cache_hit,
+            "cache_ttl_s": PLAYLIST_CACHE_TTL_S,
+            "refresh": 1 if bypass else 0,
+            "fetch_ms": float(perf.get("fetch_ms", 0) or 0),
+            "enrich_ms": float(perf.get("enrich_ms", 0) or 0),
+            "total_backend_ms": float(perf.get("total_ms", 0) or 0),
+            "total_api_ms": float(total_ms),
+        }
+
+        data = {**data, "meta": meta}
+
         return data
     except Exception as e:
         logger.error(f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e}")
@@ -235,7 +284,7 @@ def get_playlist(
 
 
 @app.post("/api/playlist-with-rekordbox", response_model=PlaylistResponse)
-def playlist_with_rekordbox(body: PlaylistWithRekordboxBody):
+async def playlist_with_rekordbox(body: PlaylistWithRekordboxBody, request: Request):
     """
     JSON で Rekordbox XML のパスを受け取る版（ローカル用）。
     {
@@ -244,7 +293,7 @@ def playlist_with_rekordbox(body: PlaylistWithRekordboxBody):
     }
     """
     try:
-        result = fetch_playlist_tracks_generic(getattr(body, "source", "spotify"), body.url)
+        result = await fetch_playlist_tracks_generic(getattr(body, "source", "spotify"), body.url, app=request.app)
         playlist_data = playlist_result_to_dict(result)
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": str(e)})
@@ -372,6 +421,7 @@ async def match_snapshot_with_xml(
 
 @app.post("/api/playlist-with-rekordbox-upload", response_model=PlaylistResponse)
 async def playlist_with_rekordbox_upload(
+    request: Request,
     url: str = Form(..., description="Playlist URL or ID or URL"),
     source: str = Form("spotify", description="spotify or apple"),
     file: UploadFile | None = File(None, description="Rekordbox collection XML"),
@@ -405,7 +455,7 @@ async def playlist_with_rekordbox_upload(
         if cached is not None:
             result = cached
         else:
-            result = fetch_playlist_tracks_generic(src, clean_url)
+            result = await fetch_playlist_tracks_generic(src, clean_url, app=request.app)
         t1_fetch = time.time()
         fetch_ms = (t1_fetch - t0_fetch) * 1000
         

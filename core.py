@@ -13,8 +13,9 @@ from __future__ import annotations
 import os
 import re
 import urllib.parse
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import logging
+import asyncio
 
 import requests
 import html as _html
@@ -22,7 +23,6 @@ from bs4 import BeautifulSoup
 import json
 import time
 from cachetools import TTLCache
-import os
 from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
 
 # Global TTL cache for playlist fetch results
@@ -234,52 +234,51 @@ def get_spotify_client() -> spotipy.Spotify:
 # =========================
 
 
-def extract_playlist_id(url_or_id: str) -> str:
-    """
-    Spotifyプレイリストの「URL / URI / ID」全部OKで受けて、
-    正しい 22文字のID だけ取り出す。
+from playwright_pool import new_context
 
-    例：
-    - https://open.spotify.com/playlist/0ZzPDztlFcDLdLbBa7hOks?si=... → 0ZzPDztlFcDLdLbBa7hOks
-    - spotify:playlist:0ZzPDztlFcDLdLbBa7hOks                     → 0ZzPDztlFcDLdLbBa7hOks
-    - 0ZzPDztlFcDLdLbBa7hOks                                      → 0ZzPDztlFcDLdLbBa7hOks
-    """
-    s = (url_or_id or "").strip()
 
-    # 1) まずは「ふつうのURL」としてパースしてみる
+async def _fetch_with_playwright_async(url: str, app: Any) -> str:
+    """Fetch page HTML using a shared Playwright browser via playwright_pool."""
+    logger.info(f"[APPLE] start url={url}")
+    context = await new_context()
+    logger.info("[APPLE] got_context")
+    page = await context.new_page()
+    page.set_default_navigation_timeout(20000)
+    page.set_default_timeout(20000)
+
+    last_error = None
     try:
-        parsed = urllib.parse.urlparse(s)
-        if parsed.scheme and parsed.netloc:
-            # 例: /playlist/0ZzPDztlFcDLdLbBa7hOks
-            parts = parsed.path.rstrip("/").split("/")
-            if parts:
-                cand = parts[-1]
-                if re.fullmatch(r"[A-Za-z0-9]{22}", cand):
-                    return cand
-    except Exception:
-        # URLとしてパースできなくても無視
-        pass
+        for attempt in range(3):
+            try:
+                logger.info(f"[APPLE] goto_start attempt={attempt + 1}")
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                logger.info("[APPLE] goto_done")
 
-    # 2) spotify:playlist:xxxxxx や /playlist/xxxxxx 形式から抜く
-    m = re.search(r"(?:playlist[/:])([A-Za-z0-9]{22})", s)
-    if m:
-        return m.group(1)
+                await page.wait_for_selector("main", timeout=20000)
+                logger.info("[APPLE] main loaded")
 
-    # 3) すでにIDだけが渡されているケース
-    if re.fullmatch(r"[A-Za-z0-9]{22}", s):
-        return s
-
-    # どれにも当てはまらない場合はエラーにする
-    raise ValueError(f"Invalid Spotify playlist URL or ID: {url_or_id}")
-
-
-# =========================
-# ストア検索リンク生成
-# =========================
-
-
-
-
+                await page.wait_for_selector(
+                    'div[role="row"], ol li, .songs-list-row',
+                    timeout=20000,
+                )
+                logger.info("[APPLE] list selector ok")
+                html = await page.content()
+                logger.info("[APPLE] parse_done")
+                return html
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[APPLE] attempt {attempt + 1} failed: {e}")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=20000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+        raise RuntimeError(f"Failed to fetch page after retries: {last_error}")
+    finally:
+        try:
+            await context.close()
+        except Exception:
+            pass
 def build_store_links(title: str, artist: str, album: str | None = None, isrc: str | None = None) -> Dict[str, str]:
     """
     Beatport / Bandcamp / iTunes (Apple Music) の検索リンクを生成。
@@ -327,6 +326,45 @@ def build_store_links(title: str, artist: str, album: str | None = None, isrc: s
 # =========================
 # プレイリスト取得
 # =========================
+
+
+def extract_playlist_id(url_or_id: str) -> str:
+    """Extract a Spotify playlist ID from a full URL or a raw ID.
+
+    Supports formats like:
+    - https://open.spotify.com/playlist/<id>
+    - https://open.spotify.com/user/<user>/playlist/<id>
+    - spotify:playlist:<id>
+    - raw 22-character ID
+    """
+    s = (url_or_id or "").strip()
+    if not s:
+        raise RuntimeError("Empty playlist URL or ID")
+
+    # spotify:playlist:<id>
+    m = re.match(r"^spotify:playlist:([a-zA-Z0-9]+)$", s)
+    if m:
+        return m.group(1)
+
+    # URL forms
+    try:
+        parsed = urlparse(s)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        if "open.spotify.com" in host:
+            parts = [p for p in path.split("/") if p]
+            # possible paths: playlist/<id> or user/<user>/playlist/<id>
+            for i, p in enumerate(parts):
+                if p == "playlist" and i + 1 < len(parts):
+                    return parts[i + 1]
+    except Exception:
+        pass
+
+    # Raw ID fallback (usually 22 chars base62)
+    if re.match(r"^[A-Za-z0-9]{16,}$", s):
+        return s
+
+    raise RuntimeError(f"Could not extract Spotify playlist ID from: {s}")
 
 
 def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
@@ -600,14 +638,10 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
+async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None) -> Dict[str, Any]:
     """
-    Best-effort scraper for Apple Music playlist pages.
-    Returns a raw dict in the same shape as `fetch_playlist_tracks` so that
-    `playlist_result_to_dict` can be reused.
-
-    This implementation uses conservative/selective parsing and attempts to
-    extract title/artist/album and per-track Apple URL where possible.
+    Best-effort scraper for Apple Music playlist pages using Playwright.
+    Lazily imports/starts Playwright and reuses a single browser stored in app.state.
     """
     # Sanitize URL: strip whitespace, surrounding angle brackets and quotes
     if url:
@@ -618,6 +652,10 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
 
     if "music.apple.com" not in (url or ""):
         raise ValueError("Apple Music playlist URL を指定してください")
+
+    # Require app for shared browser/semaphore
+    if app is None:
+        raise RuntimeError("App instance is required for Apple Music scraping (Playwright state)")
 
     # Simple in-memory cache to avoid frequent repeated scraping
     try:
@@ -642,7 +680,7 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
     
     # Throttle repeated requests for same URL
     if now - last_ts < 2:
-        time.sleep(1)
+        await asyncio.sleep(1)
 
     # Apple Music always requires dynamic rendering - use Playwright first
     # This approach is more reliable than static HTML parsing
@@ -650,7 +688,7 @@ def fetch_apple_playlist_tracks_from_web(url: str) -> Dict[str, Any]:
     items = []
     
     try:
-        html = _fetch_with_playwright(url)
+        html = await _fetch_with_playwright_async(url, app)
         soup = BeautifulSoup(html, "html.parser")
         logger.info(f"[Apple Music] Parsing HTML ({len(html)} bytes)")
         
@@ -993,7 +1031,7 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def fetch_playlist_tracks_generic(source: str, url_or_id: str) -> Dict[str, Any]:
+async def fetch_playlist_tracks_generic(source: str, url_or_id: str, app: Any | None = None) -> Dict[str, Any]:
     """
     Dispatch between spotify/apple sources. Default to spotify for compatibility.
     For Apple Music, enriches tracks with Spotify metadata (artist, album, ISRC).
@@ -1012,7 +1050,10 @@ def fetch_playlist_tracks_generic(source: str, url_or_id: str) -> Dict[str, Any]
     
     if src == "apple":
         t0_fetch = time.time()
-        result = fetch_apple_playlist_tracks_from_web(url_or_id)
+        try:
+            result = await asyncio.wait_for(fetch_apple_playlist_tracks_from_web(url_or_id, app=app), timeout=25)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Apple Music fetch timed out (25s)")
         t1_fetch = time.time()
         perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
         
@@ -1029,7 +1070,7 @@ def fetch_playlist_tracks_generic(source: str, url_or_id: str) -> Dict[str, Any]
         return result
     else:
         t0_fetch = time.time()
-        result = fetch_playlist_tracks(url_or_id)
+        result = await asyncio.to_thread(fetch_playlist_tracks, url_or_id)
         t1_fetch = time.time()
         perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
         
