@@ -35,6 +35,7 @@ APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
 APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
 APPLE_PW_COMMIT_TIMEOUT_MS = int(os.getenv("APPLE_PW_COMMIT_TIMEOUT_MS", "20000"))
 APPLE_PW_DOM_TIMEOUT_MS = int(os.getenv("APPLE_PW_DOM_TIMEOUT_MS", "7000"))
+APPLE_PW_NET_WAIT_MS = int(os.getenv("APPLE_PW_NET_WAIT_MS", "35000"))
 
 def normalize_playlist_url(url: str) -> str:
     """Normalize playlist URL for canonical cache key.
@@ -664,7 +665,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     """
     Playwright with network interception:
     1. Block heavy resources (images, CSS, fonts, media)
-    2. Listen for Apple Music API JSON responses
+    2. Listen for Apple Music API JSON responses (broader /v1/catalog/ matches including amp-api)
     3. Fall back to DOM parsing if network JSON unavailable
     4. Detect "blocked/JS-required" variants
     """
@@ -706,6 +707,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     page = None
     meta_base: Dict[str, Any] = {"apple_strategy": "playwright"}
     api_response_captured: Dict[str, Any] | None = None
+    api_candidates: list[dict] = []
 
     async def on_response_handler(response):
         """Capture Apple Music API JSON responses."""
@@ -714,27 +716,28 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             return
         try:
             url_str = response.url
-            # Match Apple Music API patterns
-            if any(
-                pattern in url_str
-                for pattern in [
-                    "/api/v1/catalog/",
-                    "/api/v1/playlist",
-                ]
-            ):
+            status = response.status
+            ct = response.headers.get("content-type", "")
+            # Match broader Apple Music API patterns (amp-api, music.apple.com)
+            match_api = False
+            if "/v1/catalog/" in url_str and "/playlists" in url_str:
+                match_api = True
+            if "amp-api.music.apple.com" in url_str and "/v1/catalog/" in url_str:
+                match_api = True
+
+            if match_api:
+                api_candidates.append({"url": url_str, "status": status})
                 if (
-                    "/playlists" in url_str
-                    and response.status == 200
-                    and "application/json" in response.headers.get("content-type", "")
+                    status == 200
+                    and "application/json" in ct
                 ):
                     try:
                         body = await response.json()
-                        # Basic validation: expect data.data or similar structure
                         if isinstance(body, dict) and body:
                             api_response_captured = {
                                 "body": body,
                                 "url": url_str,
-                                "status": response.status,
+                                "status": status,
                             }
                             logger.info(f"[Apple Network] Captured API response from {url_str}")
                     except Exception as e:
@@ -771,7 +774,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         })
 
         # Wait for API response capture (15s timeout)
-        api_wait_timeout = 15000
+        api_wait_timeout = APPLE_PW_NET_WAIT_MS
         api_wait_start = time.time()
         while api_response_captured is None:
             if (time.time() - api_wait_start) * 1000 > api_wait_timeout:
@@ -848,20 +851,33 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             except Exception:
                 pass
 
+            meta_reason = reason
+            if reason == "no_tracks":
+                meta_reason = "unsupported_playlist_variant"
+
             raise AppleFetchError(
-                f"Apple page load failed (Playwright, {reason})",
+                f"Apple page load failed (Playwright, {meta_reason})",
                 meta={
                     **meta_base,
                     "apple_playwright_phase": "network_json" if api_response_captured else "dom_fallback",
-                    "reason": reason,
+                    "reason": meta_reason,
+                    "apple_api_candidates": api_candidates[:5],
                 },
             )
 
         # cache and record timestamp
-        cache[url] = result
-        last[url] = time.time()
-        logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright")
-        return result
+        if result is not None:
+            # Attach candidate metadata for visibility
+            try:
+                result.setdefault("meta", {})
+                result["meta"].setdefault("apple_api_candidates", api_candidates[:5])
+            except Exception:
+                pass
+
+            cache[url] = result
+            last[url] = time.time()
+            logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright")
+            return result
     finally:
         try:
             if context:
