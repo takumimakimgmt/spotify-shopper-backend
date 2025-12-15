@@ -662,10 +662,11 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None) -> Dict[str, Any]:
     """
-    Playwright fallback with minimal DOM waiting:
-    - First, fetch commit HTML (wait_until="commit") and parse embedded JSON.
-    - If no tracks, short DOM fallback (5–8s) to grab scripts and parse again.
-    - Returns early with meta carrying phase/status/final URL for debugging.
+    Playwright with network interception:
+    1. Block heavy resources (images, CSS, fonts, media)
+    2. Listen for Apple Music API JSON responses
+    3. Fall back to DOM parsing if network JSON unavailable
+    4. Detect "blocked/JS-required" variants
     """
     if url:
         url = url.strip()
@@ -704,6 +705,42 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     context = None
     page = None
     meta_base: Dict[str, Any] = {"apple_strategy": "playwright"}
+    api_response_captured: Dict[str, Any] | None = None
+
+    async def on_response_handler(response):
+        """Capture Apple Music API JSON responses."""
+        nonlocal api_response_captured
+        if api_response_captured:
+            return
+        try:
+            url_str = response.url
+            # Match Apple Music API patterns
+            if any(
+                pattern in url_str
+                for pattern in [
+                    "/api/v1/catalog/",
+                    "/api/v1/playlist",
+                ]
+            ):
+                if (
+                    "/playlists" in url_str
+                    and response.status == 200
+                    and "application/json" in response.headers.get("content-type", "")
+                ):
+                    try:
+                        body = await response.json()
+                        # Basic validation: expect data.data or similar structure
+                        if isinstance(body, dict) and body:
+                            api_response_captured = {
+                                "body": body,
+                                "url": url_str,
+                                "status": response.status,
+                            }
+                            logger.info(f"[Apple Network] Captured API response from {url_str}")
+                    except Exception as e:
+                        logger.debug(f"[Apple Network] Failed to parse API response: {e}")
+        except Exception as e:
+            logger.debug(f"[Apple Network] Error in response handler: {e}")
 
     try:
         context = await new_context()
@@ -711,27 +748,59 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         page.set_default_navigation_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
         page.set_default_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
 
-        # Commit-stage fetch: avoid long DOM waits
+        # Block heavy resources
+        async def route_handler(route):
+            req_type = route.request.resource_type
+            if req_type in ("image", "stylesheet", "font", "media"):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", route_handler)
+
+        # Listen for API responses
+        page.on("response", on_response_handler)
+
+        # Commit-stage fetch
         resp = await page.goto(url, wait_until="commit", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
         status = resp.status if resp else None
         final_url = resp.url if resp else url
-        html_text = await resp.text() if resp else None
         meta_base.update({
             "apple_http_status": status,
             "apple_final_url": final_url,
         })
 
-        if html_text:
-            parsed = _parse_apple_html_payload(
-                html_text,
-                final_url or url,
-                strategy_hint="playwright",
-                meta_extra={**meta_base, "apple_playwright_phase": "commit_html"},
-            )
-            if parsed and parsed.get("items"):
-                result = parsed
+        # Wait for API response capture (15s timeout)
+        api_wait_timeout = 15000
+        api_wait_start = time.time()
+        while api_response_captured is None:
+            if (time.time() - api_wait_start) * 1000 > api_wait_timeout:
+                logger.info("[Apple Network] No API response captured within timeout")
+                break
+            await asyncio.sleep(0.2)
 
-        # Short DOM fallback if commit HTML had no tracks
+        # Try to extract tracks from API response
+        if api_response_captured:
+            try:
+                body = api_response_captured["body"]
+                # Apple API usually has data.data with attributes/name/artistName
+                tracks, playlist_name = _extract_tracks_from_json_tree(body)
+                if tracks:
+                    result = _build_apple_playlist_result(
+                        tracks,
+                        playlist_name or "Apple Music Playlist",
+                        final_url or url,
+                        meta_extra={
+                            **meta_base,
+                            "apple_playwright_phase": "network_json",
+                            "apple_api_url": api_response_captured["url"],
+                        },
+                    )
+                    logger.info(f"[Apple Network] Extracted {len(tracks)} tracks from API response")
+            except Exception as e:
+                logger.debug(f"[Apple Network] Failed to parse API response: {e}")
+
+        # DOM fallback if API response unavailable
         if result is None:
             try:
                 await page.wait_for_timeout(1000)
@@ -756,16 +825,42 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 if parsed_dom and parsed_dom.get("items"):
                     result = parsed_dom
 
+        # Detect blocked/JS-required variant
         if result is None:
+            reason = "no_tracks"
+            try:
+                page_title = await page.title()
+                page_html = await page.content()
+                first_kb = page_html[:1024].lower()
+                if any(
+                    kw in (page_title or "").lower() + first_kb
+                    for kw in [
+                        "access denied",
+                        "denied",
+                        "robot",
+                        "enable javascript",
+                        "javascript required",
+                        "js required",
+                    ]
+                ):
+                    reason = "blocked_variant"
+                    logger.info(f"[Apple Network] Detected blocked/JS-required variant: {page_title}")
+            except Exception:
+                pass
+
             raise AppleFetchError(
-                "Apple page load is slow/blocked (Playwright)",
-                meta={**meta_base, "apple_playwright_phase": "dom_fallback", "reason": "no_tracks"},
+                f"Apple page load failed (Playwright, {reason})",
+                meta={
+                    **meta_base,
+                    "apple_playwright_phase": "network_json" if api_response_captured else "dom_fallback",
+                    "reason": reason,
+                },
             )
 
         # cache and record timestamp
         cache[url] = result
         last[url] = time.time()
-        logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright ({result.get('meta', {}).get('apple_playwright_phase')})")
+        logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright")
         return result
     finally:
         try:
@@ -1038,6 +1133,44 @@ def _extract_tracks_from_json_tree(node: Any) -> tuple[list[dict], str | None]:
     return tracks, playlist_name
 
 
+def _build_apple_playlist_result(
+    tracks: list[dict],
+    playlist_name: str,
+    url: str,
+    meta_extra: dict | None = None,
+) -> Dict[str, Any]:
+    """Build a playlist result dict from tracks and metadata."""
+    items = []
+    for t in tracks:
+        title = t.get("title") or ""
+        artist = t.get("artist") or ""
+        album = t.get("album") or ""
+        apple_url = t.get("apple_url") or url
+        track = {
+            "name": title,
+            "artists": [{"name": artist}] if artist else [],
+            "album": {"name": album},
+            "external_urls": {"apple": apple_url},
+            "external_ids": {"isrc": None},
+        }
+        items.append({"track": track})
+
+    playlist = {
+        "id": url,
+        "name": playlist_name or "Apple Music Playlist",
+        "external_urls": {"apple": url},
+    }
+
+    meta = {"apple_strategy": "playwright"}
+    if meta_extra:
+        try:
+            meta.update(meta_extra)
+        except Exception:
+            pass
+
+    return {"playlist": playlist, "items": items, "meta": meta}
+
+
 def _parse_apple_html_payload(html: str, url: str, strategy_hint: str = "html", meta_extra: dict | None = None) -> Optional[Dict[str, Any]]:
     """Parse Apple Music HTML for embedded JSON and build playlist result."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1089,36 +1222,12 @@ def _parse_apple_html_payload(html: str, url: str, strategy_hint: str = "html", 
                 logger.warning(f"[Apple HTML] Failed to save debug HTML: {e}")
         return None
 
-    items = []
-    for t in tracks:
-        title = t.get("title") or ""
-        artist = t.get("artist") or ""
-        album = t.get("album") or ""
-        apple_url = t.get("apple_url") or url
-        track = {
-            "name": title,
-            "artists": [{"name": artist}] if artist else [],
-            "album": {"name": album},
-            "external_urls": {"apple": apple_url},
-            "external_ids": {"isrc": None},
-        }
-        items.append({"track": track})
-
-    playlist = {
-        "id": url,
-        "name": playlist_name or "Apple Music Playlist",
-        "external_urls": {"apple": url},
-    }
-
-    meta = {"apple_strategy": strategy_hint}
-    if meta_extra:
-        try:
-            meta.update(meta_extra)
-        except Exception:
-            pass
-
-    result = {"playlist": playlist, "items": items, "meta": meta}
-    return result
+    return _build_apple_playlist_result(
+        tracks,
+        playlist_name or "Apple Music Playlist",
+        url,
+        meta_extra={**{"apple_strategy": strategy_hint}, **(meta_extra or {})},
+    )
 
 
 async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
