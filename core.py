@@ -243,23 +243,36 @@ async def _fetch_with_playwright_async(url: str, app: Any) -> str:
     context = await new_context()
     logger.info("[APPLE] got_context")
     page = await context.new_page()
-    page.set_default_navigation_timeout(20000)
-    page.set_default_timeout(20000)
+    # Apple is heavier; allow longer timeouts
+    page.set_default_navigation_timeout(60000)
+    page.set_default_timeout(60000)
+
+    # Block heavy assets to speed up render; allow only document/script/xhr/fetch
+    allowed_resources = {"document", "script", "xhr", "fetch"}
+
+    async def _handle_route(route):
+        rtype = route.request.resource_type
+        if rtype in allowed_resources:
+            await route.continue_()
+        else:
+            await route.abort()
+
+    await page.route("**/*", _handle_route)
 
     last_error = None
     try:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 logger.info(f"[APPLE] goto_start attempt={attempt + 1}")
-                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 logger.info("[APPLE] goto_done")
 
-                await page.wait_for_selector("main", timeout=20000)
+                await page.wait_for_selector("main", timeout=60000)
                 logger.info("[APPLE] main loaded")
 
                 await page.wait_for_selector(
                     'div[role="row"], ol li, .songs-list-row',
-                    timeout=20000,
+                    timeout=60000,
                 )
                 logger.info("[APPLE] list selector ok")
                 html = await page.content()
@@ -269,10 +282,10 @@ async def _fetch_with_playwright_async(url: str, app: Any) -> str:
                 last_error = e
                 logger.warning(f"[APPLE] attempt {attempt + 1} failed: {e}")
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=20000)
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
                 except Exception:
                     pass
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
         raise RuntimeError(f"Failed to fetch page after retries: {last_error}")
     finally:
         try:
@@ -283,38 +296,30 @@ def build_store_links(title: str, artist: str, album: str | None = None, isrc: s
     """
     Beatport / Bandcamp / iTunes (Apple Music) の検索リンクを生成。
     
-    ISRC が存在する場合:
-    - Beatport: ISRC を含むクエリで検索（ISRC検索が強い）
-    - iTunes: ISRC を含むクエリで検索（ISRC検索が強い）
-    - Bandcamp: title + artist（ISRC非対応のため従来通り）
-    
-    ISRC がない場合:
-    - 全て title + artist で検索（album を含めると結果が減るため除外）
+    優先順位:
+    - Beatport: title + artist を最優先（Beatport は ISRC よりテキスト検索が強いため）
+      - title が無い場合は artist のみ、どちらも無ければ ISRC を最後の手段として使用
+    - iTunes: ISRC があれば ISRC で検索、無ければ title + artist
+    - Bandcamp: title + artist（ISRC 非対応のため従来通り）
     """
-    # ISRC がある場合は ISRC ベースのクエリを優先
-    if isrc:
-        isrc_clean = isrc.strip().upper()
-        # Beatport: ISRC + artist で検索
-        beatport_query = f"{isrc_clean} {artist.strip()}".strip()
-        beatport_q = urllib.parse.quote_plus(beatport_query)
-        beatport = f"https://www.beatport.com/search?q={beatport_q}"
-        
-        # iTunes: ISRC で検索
+    title_clean = title.strip()
+    artist_clean = artist.strip()
+    isrc_clean = isrc.strip().upper() if isrc else None
+
+    # Beatport: prefer human-readable query (title + artist), then title-only, then ISRC.
+    beatport_query = f"{title_clean} {artist_clean}".strip() or title_clean or artist_clean or (isrc_clean or "")
+    beatport = f"https://www.beatport.com/search?q={urllib.parse.quote_plus(beatport_query)}"
+
+    # Bandcamp: still title + artist (ISRC not supported)
+    bandcamp_query = f"{title_clean} {artist_clean}".strip()
+    bandcamp = f"https://bandcamp.com/search?q={urllib.parse.quote_plus(bandcamp_query)}"
+
+    # iTunes: ISRC when available, otherwise title + artist
+    if isrc_clean:
         itunes_q = urllib.parse.quote_plus(isrc_clean)
-        itunes = f"https://music.apple.com/search?term={itunes_q}"
-        
-        # Bandcamp: ISRC 非対応なので title + artist
-        bandcamp_query = f"{title.strip()} {artist.strip()}".strip()
-        bandcamp_q = urllib.parse.quote_plus(bandcamp_query)
-        bandcamp = f"https://bandcamp.com/search?q={bandcamp_q}"
     else:
-        # ISRC がない場合は従来通り title + artist
-        query = f"{title.strip()} {artist.strip()}".strip()
-        q = urllib.parse.quote_plus(query)
-        
-        beatport = f"https://www.beatport.com/search?q={q}"
-        bandcamp = f"https://bandcamp.com/search?q={q}"
-        itunes = f"https://music.apple.com/search?term={q}"
+        itunes_q = urllib.parse.quote_plus(f"{title_clean} {artist_clean}".strip())
+    itunes = f"https://music.apple.com/search?term={itunes_q}"
 
     return {
         "beatport": beatport,
