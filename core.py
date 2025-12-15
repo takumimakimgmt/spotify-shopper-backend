@@ -36,6 +36,7 @@ APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
 APPLE_PW_COMMIT_TIMEOUT_MS = int(os.getenv("APPLE_PW_COMMIT_TIMEOUT_MS", "20000"))
 APPLE_PW_DOM_TIMEOUT_MS = int(os.getenv("APPLE_PW_DOM_TIMEOUT_MS", "7000"))
 APPLE_PW_NET_WAIT_MS = int(os.getenv("APPLE_PW_NET_WAIT_MS", "35000"))
+APPLE_PW_NO_BLOCK = os.getenv("APPLE_PW_NO_BLOCK", "0") == "1"
 
 def normalize_playlist_url(url: str) -> str:
     """Normalize playlist URL for canonical cache key.
@@ -708,16 +709,19 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     meta_base: Dict[str, Any] = {"apple_strategy": "playwright"}
     api_response_captured: Dict[str, Any] | None = None
     api_candidates: list[dict] = []
+    response_candidates: list[dict] = []
+    request_candidates: list[dict] = []
 
     async def on_response_handler(response):
         """Capture Apple Music API JSON responses."""
         nonlocal api_response_captured
-        if api_response_captured:
-            return
         try:
             url_str = response.url
             status = response.status
             ct = response.headers.get("content-type", "")
+            if any(host in url_str for host in ["music.apple.com", "amp-api.music.apple.com"]):
+                if len(response_candidates) < 20:
+                    response_candidates.append({"url": url_str, "status": status, "content_type": ct})
             # Match broader Apple Music API patterns (amp-api, music.apple.com)
             match_api = False
             if "/v1/catalog/" in url_str and "/playlists" in url_str:
@@ -726,11 +730,14 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 match_api = True
 
             if match_api:
-                api_candidates.append({"url": url_str, "status": status})
+                if len(api_candidates) < 20:
+                    api_candidates.append({"url": url_str, "status": status})
                 if (
                     status == 200
                     and "application/json" in ct
                 ):
+                    if api_response_captured:
+                        return
                     try:
                         body = await response.json()
                         if isinstance(body, dict) and body:
@@ -745,24 +752,45 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         except Exception as e:
             logger.debug(f"[Apple Network] Error in response handler: {e}")
 
+    async def on_request_handler(request):
+        """Track outgoing Apple domain requests."""
+        try:
+            url_str = request.url
+            if any(host in url_str for host in ["music.apple.com", "amp-api.music.apple.com"]):
+                if len(request_candidates) < 20:
+                    request_candidates.append({
+                        "url": url_str,
+                        "method": request.method,
+                        "resourceType": request.resource_type,
+                    })
+        except Exception as e:
+            logger.debug(f"[Apple Network] Error in request handler: {e}")
+
     try:
         context = await new_context()
         page = await context.new_page()
         page.set_default_navigation_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
         page.set_default_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
 
-        # Block heavy resources
-        async def route_handler(route):
-            req_type = route.request.resource_type
-            if req_type in ("image", "stylesheet", "font", "media"):
-                await route.abort()
-            else:
-                await route.continue_()
+        # Resource blocking (safe mode: only block image/media/font, allow everything else)
+        if not APPLE_PW_NO_BLOCK:
+            async def route_handler(route):
+                req_type = route.request.resource_type
+                # Super safe: only block truly unnecessary resources
+                if req_type in ("image", "media", "font"):
+                    await route.abort()
+                else:
+                    # Allow: document, script, xhr, fetch, stylesheet, etc.
+                    await route.continue_()
 
-        await page.route("**/*", route_handler)
+            await page.route("**/*", route_handler)
+            logger.info("[Apple Network] Resource blocking enabled (safe mode: image/media/font only)")
+        else:
+            logger.info("[Apple Network] Resource blocking DISABLED (APPLE_PW_NO_BLOCK=1)")
 
-        # Listen for API responses
+        # Listen for API responses and requests
         page.on("response", on_response_handler)
+        page.on("request", on_request_handler)
 
         # Commit-stage fetch
         resp = await page.goto(url, wait_until="commit", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
@@ -772,6 +800,68 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             "apple_http_status": status,
             "apple_final_url": final_url,
         })
+
+        # Quick consent/banner handling to unblock API firing
+        try:
+            consent_selectors = [
+                "button:has-text('Accept')",
+                "button:has-text('Agree')",
+                "button:has-text('同意')",
+                "text=同意する",
+                "text=同意します",
+                "text=同意",
+                "text=Accept",
+                "text=Agree",
+            ]
+            for sel in consent_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    await locator.wait_for(timeout=800)
+                    await locator.click()
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Early blocked/consent detection before network wait (extended keyword list)
+        blocked_hint = False
+        try:
+            page_title = await page.title()
+            page_html = await page.content()
+            first_2kb = (page_html or "")[:2048].lower()
+            blocked_keywords = [
+                "access denied",
+                "denied",
+                "robot",
+                "enable javascript",
+                "javascript required",
+                "js required",
+                "consent",
+                "captcha",
+                "security check",
+                "unusual traffic",
+                "automated",
+                "bot",
+            ]
+            if any(kw in (page_title or "").lower() + first_2kb for kw in blocked_keywords):
+                blocked_hint = True
+                meta_base["blocked_hint"] = True
+                logger.warning(f"[Apple Network] Detected blocked page variant: {page_title}")
+        except Exception:
+            pass
+
+        # Light user interaction to trigger lazy loading
+        try:
+            for _ in range(2):
+                await page.wait_for_timeout(500)
+                try:
+                    await page.mouse.wheel(0, 1200)
+                except Exception:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
+                await page.wait_for_timeout(500)
+        except Exception:
+            pass
 
         # Wait for API response capture (15s timeout)
         api_wait_timeout = APPLE_PW_NET_WAIT_MS
@@ -828,32 +918,47 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 if parsed_dom and parsed_dom.get("items"):
                     result = parsed_dom
 
-        # Detect blocked/JS-required variant
+        # Detect blocked/JS-required variant with enhanced detection
         if result is None:
             reason = "no_tracks"
             try:
                 page_title = await page.title()
                 page_html = await page.content()
-                first_kb = page_html[:1024].lower()
+                first_2kb = page_html[:2048].lower()
+                blocked_keywords = [
+                    "access denied",
+                    "denied",
+                    "robot",
+                    "enable javascript",
+                    "javascript required",
+                    "js required",
+                    "captcha",
+                    "security check",
+                    "unusual traffic",
+                    "automated",
+                    "bot",
+                ]
                 if any(
-                    kw in (page_title or "").lower() + first_kb
-                    for kw in [
-                        "access denied",
-                        "denied",
-                        "robot",
-                        "enable javascript",
-                        "javascript required",
-                        "js required",
-                    ]
+                    kw in (page_title or "").lower() + first_2kb
+                    for kw in blocked_keywords
                 ):
                     reason = "blocked_variant"
                     logger.info(f"[Apple Network] Detected blocked/JS-required variant: {page_title}")
             except Exception:
                 pass
 
+            # Priority: blocked_hint > detected blocked > unsupported
             meta_reason = reason
-            if reason == "no_tracks":
-                meta_reason = "unsupported_playlist_variant"
+            if blocked_hint:
+                meta_reason = "blocked_variant"
+            elif reason == "blocked_variant":
+                meta_reason = "blocked_variant"
+            elif reason == "no_tracks":
+                # Only mark as unsupported if we have Apple responses but no tracks
+                if response_candidates:
+                    meta_reason = "unsupported_playlist_variant"
+                else:
+                    meta_reason = "no_apple_traffic"
 
             raise AppleFetchError(
                 f"Apple page load failed (Playwright, {meta_reason})",
@@ -861,16 +966,22 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     **meta_base,
                     "apple_playwright_phase": "network_json" if api_response_captured else "dom_fallback",
                     "reason": meta_reason,
-                    "apple_api_candidates": api_candidates[:5],
+                    "apple_api_candidates": api_candidates[:20],
+                    "apple_response_candidates": response_candidates[:20],
+                    "apple_request_candidates": request_candidates[:20],
                 },
             )
 
         # cache and record timestamp
         if result is not None:
-            # Attach candidate metadata for visibility
+            # Attach full candidate metadata for visibility
             try:
                 result.setdefault("meta", {})
-                result["meta"].setdefault("apple_api_candidates", api_candidates[:5])
+                result["meta"].setdefault("apple_api_candidates", api_candidates[:20])
+                if response_candidates:
+                    result["meta"].setdefault("apple_response_candidates", response_candidates[:20])
+                if request_candidates:
+                    result["meta"].setdefault("apple_request_candidates", request_candidates[:20])
             except Exception:
                 pass
 
