@@ -1221,7 +1221,12 @@ async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
     return result
 
 
-async def fetch_playlist_tracks_generic(source: str, url_or_id: str, app: Any | None = None) -> Dict[str, Any]:
+async def fetch_playlist_tracks_generic(
+    source: str,
+    url_or_id: str,
+    app: Any | None = None,
+    enrich_spotify: bool | None = None,
+) -> Dict[str, Any]:
     """
     Dispatch between spotify/apple sources. Default to spotify for compatibility.
     For Apple Music, enriches tracks with Spotify metadata (artist, album, ISRC).
@@ -1264,15 +1269,21 @@ async def fetch_playlist_tracks_generic(source: str, url_or_id: str, app: Any | 
                 raise RuntimeError(f"Apple Music fetch timed out ({apple_playwright_timeout_s}s)")
         t1_fetch = time.time()
         perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
-        
-        # Enrich Apple tracks with Spotify metadata
-        t0_enrich = time.time()
-        result = _enrich_apple_tracks_with_spotify(result)
-        t1_enrich = time.time()
-        perf['enrich_ms'] = (t1_enrich - t0_enrich) * 1000
+
+        # Determine enrichment default: if not specified, default False for Apple
+        do_enrich = bool(enrich_spotify) if enrich_spotify is not None else False
 
         meta = result.get("meta") or {}
         meta["apple_strategy"] = apple_strategy
+        if do_enrich:
+            t0_enrich = time.time()
+            result = _enrich_apple_tracks_with_spotify(result)
+            t1_enrich = time.time()
+            perf['enrich_ms'] = (t1_enrich - t0_enrich) * 1000
+        else:
+            # Skip Spotify enrichment deliberately
+            meta["apple_enrich_skipped"] = True
+            perf['enrich_ms'] = 0.0
         result["meta"] = meta
 
         result['perf'] = perf

@@ -70,6 +70,9 @@ class PlaylistMetaModel(BaseModel):
     enrich_ms: Optional[float] = None
     total_backend_ms: Optional[float] = None
     total_api_ms: Optional[float] = None
+    # Apple-specific meta flags
+    apple_strategy: Optional[str] = None  # 'html' | 'playwright'
+    apple_enrich_skipped: Optional[bool] = None
 
 
 class PlaylistResponse(BaseModel):
@@ -208,6 +211,7 @@ async def get_playlist(
     source: str = Query("spotify", description="spotify or apple"),
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
     isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
+    enrich_spotify: Optional[int] = Query(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
     refresh: Optional[int] = Query(None, description="Bypass cache when set to 1"),
 ):
     """
@@ -228,14 +232,30 @@ async def get_playlist(
     # Call core directly so we can attach debug info on failure
     try:
         # Cache lookup (allow bypass via refresh=1)
+        # Determine effective enrich flag for Apple defaulting to 0 unless explicitly set
+        effective_enrich_spotify = None
+        if src == "apple":
+            # Default 0 for Apple if not specified; coerce to 0/1
+            if enrich_spotify is None:
+                effective_enrich_spotify = 0
+            else:
+                effective_enrich_spotify = 1 if int(enrich_spotify) == 1 else 0
+        # Include enrich flag in cache key for Apple to avoid mixing
         cache_key = f"{src}:{normalized_url}"
+        if src == "apple":
+            cache_key = f"{cache_key}:enrich={effective_enrich_spotify}"
         bypass = (refresh == 1)
         cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
         cache_hit = (cached is not None)
         if cached is not None:
             result = cached
         else:
-            result = await fetch_playlist_tracks_generic(src, clean_url, app=request.app)
+            result = await fetch_playlist_tracks_generic(
+                src,
+                clean_url,
+                app=request.app,
+                enrich_spotify=(bool(effective_enrich_spotify) if effective_enrich_spotify is not None else None),
+            )
         perf = result.get('perf', {})
         
         # Optional ISRC enrichment (best-effort)
@@ -270,6 +290,8 @@ async def get_playlist(
             f"total_backend_ms={perf.get('total_ms', 0):.1f} total_api_ms={total_ms:.1f} tracks={tracks_count}"
         )
 
+        # Merge core-provided meta (e.g., apple_strategy, apple_enrich_skipped)
+        core_meta = result.get("meta") or {}
         meta = {
             "cache_hit": cache_hit,
             "cache_ttl_s": PLAYLIST_CACHE_TTL_S,
@@ -279,14 +301,35 @@ async def get_playlist(
             "total_backend_ms": float(perf.get("total_ms", 0) or 0),
             "total_api_ms": float(total_ms),
         }
+        try:
+            if isinstance(core_meta, dict):
+                meta.update(core_meta)
+        except Exception:
+            pass
 
         data = {**data, "meta": meta}
 
         return data
     except Exception as e:
-        logger.error(f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e}")
-        # Return structured detail so client can see which source was attempted
-        raise HTTPException(status_code=400, detail={"error": str(e), "used_source": src, "url": clean_url})
+        # Include Apple-specific meta in error detail for faster diagnosis
+        error_meta = {}
+        if src == "apple":
+            try:
+                # If we reached error, likely Playwright timed out
+                error_meta = {
+                    "apple_strategy": "playwright",
+                    "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
+                }
+            except Exception:
+                pass
+        logger.error(f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}")
+        # Return structured detail including meta to aid client-side separation
+        raise HTTPException(status_code=400, detail={
+            "error": str(e),
+            "used_source": src,
+            "url": clean_url,
+            "meta": error_meta,
+        })
 
 
 @app.post("/api/playlist-with-rekordbox", response_model=PlaylistResponse)
@@ -431,6 +474,7 @@ async def playlist_with_rekordbox_upload(
     url: str = Form(..., description="Playlist URL or ID or URL"),
     source: str = Form("spotify", description="spotify or apple"),
     file: UploadFile | None = File(None, description="Rekordbox collection XML"),
+    enrich_spotify: Optional[int] = Form(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
     refresh: Optional[int] = Form(None, description="Bypass cache when set to 1"),
 ):
     """
@@ -454,14 +498,28 @@ async def playlist_with_rekordbox_upload(
 
     try:
         t0_fetch = time.time()
+        # Determine effective enrich flag for Apple defaulting to 0 unless explicitly set
+        effective_enrich_spotify = None
+        if src == "apple":
+            if enrich_spotify is None:
+                effective_enrich_spotify = 0
+            else:
+                effective_enrich_spotify = 1 if int(enrich_spotify) == 1 else 0
         cache_key = f"{src}:{normalized_url}"
+        if src == "apple":
+            cache_key = f"{cache_key}:enrich={effective_enrich_spotify}"
         bypass = (refresh == 1)
         cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
         cache_hit = cached is not None
         if cached is not None:
             result = cached
         else:
-            result = await fetch_playlist_tracks_generic(src, clean_url, app=request.app)
+            result = await fetch_playlist_tracks_generic(
+                src,
+                clean_url,
+                app=request.app,
+                enrich_spotify=(bool(effective_enrich_spotify) if effective_enrich_spotify is not None else None),
+            )
         t1_fetch = time.time()
         fetch_ms = (t1_fetch - t0_fetch) * 1000
         
@@ -474,8 +532,22 @@ async def playlist_with_rekordbox_upload(
         except Exception:
             pass
     except Exception as e:
-        logger.error(f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e}")
-        raise HTTPException(status_code=400, detail={"error": str(e), "used_source": src, "url": clean_url})
+        error_meta = {}
+        if src == "apple":
+            try:
+                error_meta = {
+                    "apple_strategy": "playwright",
+                    "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
+                }
+            except Exception:
+                pass
+        logger.error(f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}")
+        raise HTTPException(status_code=400, detail={
+            "error": str(e),
+            "used_source": src,
+            "url": clean_url,
+            "meta": error_meta,
+        })
 
     # 一時ファイルに XML を書き出し
     playlist_with_owned = playlist_data
