@@ -18,6 +18,7 @@ import logging
 import asyncio
 
 import requests
+import httpx
 import html as _html
 from bs4 import BeautifulSoup
 import json
@@ -29,6 +30,9 @@ from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
 _ENV = os.getenv("ENV", "prod").lower()
 _TTL_SECONDS = 3600 if _ENV == "dev" else 21600  # dev:1h, prod:6h
 _PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=_TTL_SECONDS)
+APPLE_HTTP_TIMEOUT_S = float(os.getenv("APPLE_HTTP_TIMEOUT_S", "20"))
+APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
+APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
 
 def normalize_playlist_url(url: str) -> str:
     """Normalize playlist URL for canonical cache key.
@@ -243,9 +247,10 @@ async def _fetch_with_playwright_async(url: str, app: Any) -> str:
     context = await new_context()
     logger.info("[APPLE] got_context")
     page = await context.new_page()
-    # Apple is heavier; allow longer timeouts
-    page.set_default_navigation_timeout(60000)
-    page.set_default_timeout(60000)
+    # Apple is heavier; allow longer timeouts (90s)
+    page_timeout_ms = 90000
+    page.set_default_navigation_timeout(page_timeout_ms)
+    page.set_default_timeout(page_timeout_ms)
 
     # Block heavy assets to speed up render; allow only document/script/xhr/fetch
     allowed_resources = {"document", "script", "xhr", "fetch"}
@@ -260,19 +265,20 @@ async def _fetch_with_playwright_async(url: str, app: Any) -> str:
     await page.route("**/*", _handle_route)
 
     last_error = None
+    max_attempts = 3
     try:
-        for attempt in range(2):
+        for attempt in range(max_attempts):
             try:
                 logger.info(f"[APPLE] goto_start attempt={attempt + 1}")
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(url, wait_until="networkidle", timeout=page_timeout_ms)
                 logger.info("[APPLE] goto_done")
 
-                await page.wait_for_selector("main", timeout=60000)
+                await page.wait_for_selector("main", timeout=page_timeout_ms)
                 logger.info("[APPLE] main loaded")
 
                 await page.wait_for_selector(
                     'div[role="row"], ol li, .songs-list-row',
-                    timeout=60000,
+                    timeout=page_timeout_ms,
                 )
                 logger.info("[APPLE] list selector ok")
                 html = await page.content()
@@ -280,13 +286,14 @@ async def _fetch_with_playwright_async(url: str, app: Any) -> str:
                 return html
             except Exception as e:
                 last_error = e
-                logger.warning(f"[APPLE] attempt {attempt + 1} failed: {e}")
+                logger.warning(f"[APPLE] attempt {attempt + 1}/{max_attempts} failed: {e}")
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                    await page.reload(wait_until="domcontentloaded", timeout=page_timeout_ms)
                 except Exception:
                     pass
-                await asyncio.sleep(1.5)
-        raise RuntimeError(f"Failed to fetch page after retries: {last_error}")
+                backoff = 1.5 * (attempt + 1)
+                await asyncio.sleep(backoff)
+        raise RuntimeError(f"Failed to fetch page after retries ({max_attempts}): {last_error}")
     finally:
         try:
             await context.close()
@@ -1036,6 +1043,184 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _extract_tracks_from_json_tree(node: Any) -> tuple[list[dict], str | None]:
+    """Recursively walk JSON looking for track-like objects with attributes/name/artistName.
+
+    Returns a tuple of (tracks, playlist_name_candidate).
+    """
+    tracks: list[dict] = []
+    playlist_name: str | None = None
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_track(title: str | None, artist: str | None, album: str | None, url: str | None) -> None:
+        if not title or not artist:
+            return
+        key = (title.strip().lower(), artist.strip().lower(), (album or "").strip().lower())
+        if key in seen:
+            return
+        seen.add(key)
+        tracks.append({
+            "title": _fix_mojibake(title.strip()),
+            "artist": _fix_mojibake(artist.strip()),
+            "album": _fix_mojibake(album.strip()) if album else "",
+            "apple_url": url or "",
+        })
+
+    def walk(obj: Any):
+        nonlocal playlist_name
+        if isinstance(obj, dict):
+            # Playlist name candidate
+            if playlist_name is None:
+                name = obj.get("playlistName") or obj.get("name") or (obj.get("attributes") or {}).get("name")
+                if isinstance(name, str) and name.strip():
+                    playlist_name = _fix_mojibake(name.strip())
+
+            attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else None
+            if attrs:
+                title = attrs.get("name") or attrs.get("title")
+                artist = attrs.get("artistName") or attrs.get("artist")
+                album = (
+                    attrs.get("albumName")
+                    or attrs.get("collectionName")
+                    or attrs.get("albumTitle")
+                )
+                url = attrs.get("url") or attrs.get("shareUrl") or attrs.get("permalink")
+                if title and artist:
+                    add_track(title, artist, album, url)
+
+            # Direct dict with name/artist keys
+            if "name" in obj and "artistName" in obj and isinstance(obj.get("name"), str):
+                add_track(obj.get("name"), obj.get("artistName"), obj.get("albumName") or obj.get("collectionName"), obj.get("url"))
+
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    walk(node)
+    return tracks, playlist_name
+
+
+async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
+    """Attempt to fetch Apple Music playlist via static HTML/embedded JSON before Playwright.
+
+    Returns playlist dict on success, or None to signal fallback to Playwright.
+    """
+    if url:
+        url = url.strip().strip('"\'')
+        if url.startswith("<") and url.endswith(">"):
+            url = url[1:-1].strip()
+
+    if "music.apple.com" not in (url or ""):
+        raise ValueError("Apple Music playlist URL を指定してください")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    timeout = httpx.Timeout(APPLE_HTTP_TIMEOUT_S)
+    last_error: Exception | None = None
+    html: str | None = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        for attempt in range(APPLE_HTTP_RETRIES + 1):
+            try:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                html = resp.text
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[Apple HTML] attempt {attempt + 1}/{APPLE_HTTP_RETRIES + 1} failed: {e}")
+                await asyncio.sleep(1.0 * (attempt + 1))
+
+    if not html:
+        logger.warning(f"[Apple HTML] Failed to fetch HTML; fallback to Playwright. last_error={last_error}")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Collect candidate scripts (priority: __NEXT_DATA__, ld+json, other application/json)
+    candidate_scripts: list[str] = []
+    for script in soup.find_all("script"):
+        script_id = script.get("id", "")
+        script_type = (script.get("type") or "").lower()
+        if script_id == "__NEXT_DATA__" or script_type == "application/json" or script_type == "application/ld+json":
+            text = script.string or script.get_text() or ""
+            if text.strip():
+                candidate_scripts.append(text)
+
+    tracks: list[dict] = []
+    playlist_name: str | None = None
+
+    def try_parse_payload(payload_text: str) -> bool:
+        nonlocal tracks, playlist_name
+        try:
+            data = json.loads(payload_text)
+        except Exception as e:
+            logger.debug(f"[Apple HTML] JSON parse failed: {e}")
+            return False
+        candidate_tracks, pl_name = _extract_tracks_from_json_tree(data)
+        if candidate_tracks:
+            tracks = candidate_tracks
+            playlist_name = playlist_name or pl_name
+            return True
+        return False
+
+    # Try scripts in order
+    for text in candidate_scripts:
+        if try_parse_payload(text):
+            break
+
+    if not tracks:
+        title = soup.title.string.strip() if soup.title and soup.title.string else None
+        if title:
+            playlist_name = playlist_name or _fix_mojibake(title)
+
+    if not tracks:
+        if APPLE_DEBUG_HTML:
+            try:
+                os.makedirs("_debug", exist_ok=True)
+                with open("_debug/apple_last.html", "w", encoding="utf-8") as f:
+                    f.write(html[:200000])
+                logger.info("[Apple HTML] Saved debug HTML to _debug/apple_last.html")
+            except Exception as e:
+                logger.warning(f"[Apple HTML] Failed to save debug HTML: {e}")
+        logger.info("[Apple HTML] No tracks found in embedded JSON; will fallback to Playwright")
+        return None
+
+    # Build response structure consistent with Playwright scraper
+    items = []
+    for t in tracks:
+        title = t.get("title") or ""
+        artist = t.get("artist") or ""
+        album = t.get("album") or ""
+        apple_url = t.get("apple_url") or url
+        track = {
+            "name": title,
+            "artists": [{"name": artist}] if artist else [],
+            "album": {"name": album},
+            "external_urls": {"apple": apple_url},
+            "external_ids": {"isrc": None},
+        }
+        items.append({"track": track})
+
+    playlist = {
+        "id": url,
+        "name": playlist_name or "Apple Music Playlist",
+        "external_urls": {"apple": url},
+    }
+
+    result = {"playlist": playlist, "items": items, "meta": {"apple_strategy": "html"}}
+    logger.info(f"[Apple HTML] Parsed {len(items)} tracks from embedded JSON")
+    return result
+
+
 async def fetch_playlist_tracks_generic(source: str, url_or_id: str, app: Any | None = None) -> Dict[str, Any]:
     """
     Dispatch between spotify/apple sources. Default to spotify for compatibility.
@@ -1055,10 +1240,28 @@ async def fetch_playlist_tracks_generic(source: str, url_or_id: str, app: Any | 
     
     if src == "apple":
         t0_fetch = time.time()
+        apple_playwright_timeout_s = 95
+        apple_strategy = "html"
+        result: Dict[str, Any] | None = None
+
+        # HTTP-first attempt
         try:
-            result = await asyncio.wait_for(fetch_apple_playlist_tracks_from_web(url_or_id, app=app), timeout=25)
-        except asyncio.TimeoutError:
-            raise RuntimeError("Apple Music fetch timed out (25s)")
+            result = await asyncio.wait_for(
+                fetch_apple_playlist_http_first(url_or_id),
+                timeout=APPLE_HTTP_TIMEOUT_S,
+            )
+        except Exception as e:
+            logger.info(f"[Apple] HTML-first failed, will fallback to Playwright: {e}")
+
+        if not result:
+            apple_strategy = "playwright"
+            try:
+                result = await asyncio.wait_for(
+                    fetch_apple_playlist_tracks_from_web(url_or_id, app=app),
+                    timeout=apple_playwright_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"Apple Music fetch timed out ({apple_playwright_timeout_s}s)")
         t1_fetch = time.time()
         perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
         
@@ -1067,7 +1270,11 @@ async def fetch_playlist_tracks_generic(source: str, url_or_id: str, app: Any | 
         result = _enrich_apple_tracks_with_spotify(result)
         t1_enrich = time.time()
         perf['enrich_ms'] = (t1_enrich - t0_enrich) * 1000
-        
+
+        meta = result.get("meta") or {}
+        meta["apple_strategy"] = apple_strategy
+        result["meta"] = meta
+
         result['perf'] = perf
         t1_total = time.time()
         perf['total_ms'] = (t1_total - t0_total) * 1000
