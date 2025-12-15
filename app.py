@@ -312,10 +312,9 @@ async def get_playlist(
         return data
     except Exception as e:
         # Include Apple-specific meta in error detail for faster diagnosis
-        error_meta = {}
-        if src == "apple":
+        error_meta = getattr(e, "meta", {}) if hasattr(e, "meta") else {}
+        if src == "apple" and not error_meta:
             try:
-                # If we reached error, likely Playwright timed out
                 error_meta = {
                     "apple_strategy": "playwright",
                     "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
@@ -532,8 +531,8 @@ async def playlist_with_rekordbox_upload(
         except Exception:
             pass
     except Exception as e:
-        error_meta = {}
-        if src == "apple":
+        error_meta = getattr(e, "meta", {}) if hasattr(e, "meta") else {}
+        if src == "apple" and not error_meta:
             try:
                 error_meta = {
                     "apple_strategy": "playwright",

@@ -33,6 +33,8 @@ _PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=_TTL_SECONDS)
 APPLE_HTTP_TIMEOUT_S = float(os.getenv("APPLE_HTTP_TIMEOUT_S", "20"))
 APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
 APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
+APPLE_PW_COMMIT_TIMEOUT_MS = int(os.getenv("APPLE_PW_COMMIT_TIMEOUT_MS", "20000"))
+APPLE_PW_DOM_TIMEOUT_MS = int(os.getenv("APPLE_PW_DOM_TIMEOUT_MS", "7000"))
 
 def normalize_playlist_url(url: str) -> str:
     """Normalize playlist URL for canonical cache key.
@@ -74,6 +76,14 @@ from spotipy.exceptions import SpotifyException
 
 # Configure logger for this module
 logger = logging.getLogger(__name__)
+
+
+class AppleFetchError(Exception):
+    """Custom error to carry Apple-specific meta for diagnostics."""
+
+    def __init__(self, message: str, meta: dict | None = None):
+        super().__init__(message)
+        self.meta = meta or {}
 
 
 def _fix_mojibake(s: str) -> str:
@@ -652,10 +662,11 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None) -> Dict[str, Any]:
     """
-    Best-effort scraper for Apple Music playlist pages using Playwright.
-    Lazily imports/starts Playwright and reuses a single browser stored in app.state.
+    Playwright fallback with minimal DOM waiting:
+    - First, fetch commit HTML (wait_until="commit") and parse embedded JSON.
+    - If no tracks, short DOM fallback (5–8s) to grab scripts and parse again.
+    - Returns early with meta carrying phase/status/final URL for debugging.
     """
-    # Sanitize URL: strip whitespace, surrounding angle brackets and quotes
     if url:
         url = url.strip()
         if url.startswith("<") and url.endswith(">"):
@@ -665,18 +676,15 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     if "music.apple.com" not in (url or ""):
         raise ValueError("Apple Music playlist URL を指定してください")
 
-    # Require app for shared browser/semaphore
     if app is None:
         raise RuntimeError("App instance is required for Apple Music scraping (Playwright state)")
 
-    # Simple in-memory cache to avoid frequent repeated scraping
     try:
         cache = fetch_apple_playlist_tracks_from_web._cache
     except AttributeError:
         cache = TTLCache(maxsize=256, ttl=300)
         fetch_apple_playlist_tracks_from_web._cache = cache
 
-    # Per-URL last fetch timestamp to throttle accidental repeated hits
     try:
         last = fetch_apple_playlist_tracks_from_web._last_fetch
     except AttributeError:
@@ -685,158 +693,86 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
 
     now = time.time()
     last_ts = last.get(url, 0)
-    
-    # Return cached result if available
+
     if url in cache:
         return cache[url]
-    
-    # Throttle repeated requests for same URL
+
     if now - last_ts < 2:
         await asyncio.sleep(1)
 
-    # Apple Music always requires dynamic rendering - use Playwright first
-    # This approach is more reliable than static HTML parsing
-    playlist_name = "Apple Music Playlist"
-    items = []
-    
+    result: Dict[str, Any] | None = None
+    context = None
+    page = None
+    meta_base: Dict[str, Any] = {"apple_strategy": "playwright"}
+
     try:
-        html = await _fetch_with_playwright_async(url, app)
-        soup = BeautifulSoup(html, "html.parser")
-        logger.info(f"[Apple Music] Parsing HTML ({len(html)} bytes)")
-        
-        # Extract playlist name from rendered page
-        h1 = soup.find("h1")
-        if h1 and h1.get_text(strip=True):
-            playlist_name = _fix_mojibake(h1.get_text(strip=True))
-            logger.info(f"[Apple Music] Found playlist name: {playlist_name}")
-        elif soup.title and soup.title.string:
-            playlist_name = _fix_mojibake(soup.title.string.strip())
-            logger.info(f"[Apple Music] Using title as playlist name: {playlist_name}")
-        
-        # Try role="row" selector from Apple Music table layout
-        rows = soup.find_all(attrs={'role': 'row'})
-        logger.info(f"[Apple Music] Found {len(rows)} rows")
-        if rows:
-            # Skip header row (first row)
-            for idx, row in enumerate(rows[1:], start=1):
-                # Use pipe separator to split into cells, then clean up
-                text = row.get_text(separator='|')
-                parts = [p.strip() for p in text.split('|') if p.strip()]
-                
-                if len(parts) >= 5:
-                    # Format: [song, artist, rank?, artist_dup, album, preview(?), time]
-                    # Pick fields by position
-                    title = _fix_mojibake(parts[0]) if len(parts) > 0 else ""
-                    artist = _fix_mojibake(parts[1]) if len(parts) > 1 else ""
-                    # Album should be at index 4 or later, but skip preview/time
-                    album = ""
-                    for part_idx in range(4, len(parts)):
-                        candidate = parts[part_idx]
-                        # Skip "プレビュー", "preview" and time format
-                        if candidate and candidate not in ("プレビュー", "preview"):
-                            if not (":" in candidate and candidate.count(":") == 1):
-                                album = _fix_mojibake(candidate)
-                                break
-                    
-                    apple_track_url = ""
-                    for a in row.find_all("a", href=True):
-                        href = a.get("href", "")
-                        if "music.apple.com" in href and "/song/" in href:
-                            apple_track_url = href
-                            break
-                    
-                    isrc = None
-                    
-                    track = {
-                        "name": title,
-                        "artists": [{"name": artist}] if artist else [],
-                        "album": {"name": album},
-                        "external_urls": {"apple": apple_track_url},
-                        "external_ids": {"isrc": isrc},
-                    }
-                    
-                    items.append({"track": track})
-        
-        # Fallback: if role=row didn't work, try other selectors
-        if not items:
-            logger.info(f"[Apple Music] Role=row parsing found 0 tracks, trying fallback selectors")
-            candidates = []
-            candidates.extend(soup.select("ol li"))
-            candidates.extend(soup.select("ul li"))
-            candidates.extend(soup.select("div[role='listitem']"))
-            candidates.extend(soup.select("div.songs-list-row"))
-            logger.info(f"[Apple Music] Found {len(candidates)} fallback candidates")
+        context = await new_context()
+        page = await context.new_page()
+        page.set_default_navigation_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
+        page.set_default_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
 
-            seen = set()
-            for row in candidates:
-                text = row.get_text(" ", strip=True)
-                if not text or text in seen:
-                    continue
-                seen.add(text)
+        # Commit-stage fetch: avoid long DOM waits
+        resp = await page.goto(url, wait_until="commit", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
+        status = resp.status if resp else None
+        final_url = resp.url if resp else url
+        html_text = await resp.text() if resp else None
+        meta_base.update({
+            "apple_http_status": status,
+            "apple_final_url": final_url,
+        })
 
-                title = ""
-                t_el = row.select_one("h3") or row.select_one("[data-test-song-title]") or row.select_one(".songs-list-row__song-title")
-                if t_el and t_el.get_text(strip=True):
-                    title = _fix_mojibake(t_el.get_text(strip=True))
-                else:
-                    b = row.select_one("strong") or row.select_one("b")
-                    if b and b.get_text(strip=True):
-                        title = _fix_mojibake(b.get_text(strip=True))
-                    else:
-                        title = _fix_mojibake(text.split("—")[0].strip())
+        if html_text:
+            parsed = _parse_apple_html_payload(
+                html_text,
+                final_url or url,
+                strategy_hint="playwright",
+                meta_extra={**meta_base, "apple_playwright_phase": "commit_html"},
+            )
+            if parsed and parsed.get("items"):
+                result = parsed
 
-                artist = ""
-                a_el = row.select_one(".songs-list-row__by-line") or row.select_one("[data-test-artist-name]") or row.select_one(".byline")
-                if a_el and a_el.get_text(strip=True):
-                    artist = _fix_mojibake(a_el.get_text(strip=True))
-                else:
-                    parts = text.split("–")
-                    if len(parts) >= 2:
-                        artist = _fix_mojibake(parts[1].strip())
+        # Short DOM fallback if commit HTML had no tracks
+        if result is None:
+            try:
+                await page.wait_for_timeout(1000)
+                try:
+                    await page.wait_for_selector(
+                        'script[id="__NEXT_DATA__"], script[type="application/json"], script[type="application/ld+json"]',
+                        timeout=APPLE_PW_DOM_TIMEOUT_MS,
+                    )
+                except Exception:
+                    pass
+                html_dom = await page.content()
+            except Exception:
+                html_dom = None
 
-                album = ""
-                album_el = row.select_one(".songs-list-row__collection") or row.select_one("[data-test-album-name]")
-                if album_el and album_el.get_text(strip=True):
-                    album = _fix_mojibake(album_el.get_text(strip=True))
+            if html_dom:
+                parsed_dom = _parse_apple_html_payload(
+                    html_dom,
+                    final_url or url,
+                    strategy_hint="playwright",
+                    meta_extra={**meta_base, "apple_playwright_phase": "dom_fallback"},
+                )
+                if parsed_dom and parsed_dom.get("items"):
+                    result = parsed_dom
 
-                apple_track_url = ""
-                for a in row.find_all("a", href=True):
-                    href = a.get("href", "")
-                    if "music.apple.com" in href and "/song/" in href:
-                        apple_track_url = href
-                        break
+        if result is None:
+            raise AppleFetchError(
+                "Apple page load is slow/blocked (Playwright)",
+                meta={**meta_base, "apple_playwright_phase": "dom_fallback", "reason": "no_tracks"},
+            )
 
-                isrc = None
-
-                track = {
-                    "name": title,
-                    "artists": [{"name": artist}] if artist else [],
-                    "album": {"name": album},
-                    "external_urls": {"apple": apple_track_url},
-                    "external_ids": {"isrc": isrc},
-                }
-
-                items.append({"track": track})
-        
-        logger.info(f"[Apple Music] Successfully parsed {len(items)} tracks")
-    except Exception as e:
-        # If Playwright is not available or rendering fails, raise error
-        logger.error(f"[Apple Music] Failed to fetch playlist: {e}")
-        raise RuntimeError(f"Failed to fetch Apple Music playlist with Playwright: {e}")
-    
-    if not items:
-        logger.warning(f"[Apple Music] No tracks found in playlist at {url}")
-    
-    playlist = {"id": url, "name": playlist_name, "external_urls": {"apple": url}}
-
-    result = {"playlist": playlist, "items": items}
-
-    # cache and record timestamp
-    cache[url] = result
-    last[url] = time.time()
-    logger.info(f"[Apple Music] Cached result for {url}")
-
-    return result
+        # cache and record timestamp
+        cache[url] = result
+        last[url] = time.time()
+        logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright ({result.get('meta', {}).get('apple_playwright_phase')})")
+        return result
+    finally:
+        try:
+            if context:
+                await context.close()
+        except Exception:
+            pass
 
 
 def _fetch_with_playwright(url: str) -> str:
@@ -1102,47 +1038,8 @@ def _extract_tracks_from_json_tree(node: Any) -> tuple[list[dict], str | None]:
     return tracks, playlist_name
 
 
-async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
-    """Attempt to fetch Apple Music playlist via static HTML/embedded JSON before Playwright.
-
-    Returns playlist dict on success, or None to signal fallback to Playwright.
-    """
-    if url:
-        url = url.strip().strip('"\'')
-        if url.startswith("<") and url.endswith(">"):
-            url = url[1:-1].strip()
-
-    if "music.apple.com" not in (url or ""):
-        raise ValueError("Apple Music playlist URL を指定してください")
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-
-    timeout = httpx.Timeout(APPLE_HTTP_TIMEOUT_S)
-    last_error: Exception | None = None
-    html: str | None = None
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        for attempt in range(APPLE_HTTP_RETRIES + 1):
-            try:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                html = resp.text
-                break
-            except Exception as e:
-                last_error = e
-                logger.warning(f"[Apple HTML] attempt {attempt + 1}/{APPLE_HTTP_RETRIES + 1} failed: {e}")
-                await asyncio.sleep(1.0 * (attempt + 1))
-
-    if not html:
-        logger.warning(f"[Apple HTML] Failed to fetch HTML; fallback to Playwright. last_error={last_error}")
-        return None
-
+def _parse_apple_html_payload(html: str, url: str, strategy_hint: str = "html", meta_extra: dict | None = None) -> Optional[Dict[str, Any]]:
+    """Parse Apple Music HTML for embedded JSON and build playlist result."""
     soup = BeautifulSoup(html, "html.parser")
 
     # Collect candidate scripts (priority: __NEXT_DATA__, ld+json, other application/json)
@@ -1172,7 +1069,6 @@ async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
             return True
         return False
 
-    # Try scripts in order
     for text in candidate_scripts:
         if try_parse_payload(text):
             break
@@ -1191,10 +1087,8 @@ async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
                 logger.info("[Apple HTML] Saved debug HTML to _debug/apple_last.html")
             except Exception as e:
                 logger.warning(f"[Apple HTML] Failed to save debug HTML: {e}")
-        logger.info("[Apple HTML] No tracks found in embedded JSON; will fallback to Playwright")
         return None
 
-    # Build response structure consistent with Playwright scraper
     items = []
     for t in tracks:
         title = t.get("title") or ""
@@ -1216,9 +1110,71 @@ async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
         "external_urls": {"apple": url},
     }
 
-    result = {"playlist": playlist, "items": items, "meta": {"apple_strategy": "html"}}
-    logger.info(f"[Apple HTML] Parsed {len(items)} tracks from embedded JSON")
+    meta = {"apple_strategy": strategy_hint}
+    if meta_extra:
+        try:
+            meta.update(meta_extra)
+        except Exception:
+            pass
+
+    result = {"playlist": playlist, "items": items, "meta": meta}
     return result
+
+
+async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
+    """Attempt to fetch Apple Music playlist via static HTML/embedded JSON before Playwright.
+
+    Returns playlist dict on success, or None to signal fallback to Playwright.
+    """
+    if url:
+        url = url.strip().strip('"\'')
+        if url.startswith("<") and url.endswith(">"):
+            url = url[1:-1].strip()
+
+    if "music.apple.com" not in (url or ""):
+        raise ValueError("Apple Music playlist URL を指定してください")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    timeout = httpx.Timeout(APPLE_HTTP_TIMEOUT_S)
+    last_error: Exception | None = None
+    html: str | None = None
+    status_code: int | None = None
+    final_url: str | None = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        for attempt in range(APPLE_HTTP_RETRIES + 1):
+            try:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                html = resp.text
+                status_code = resp.status_code
+                final_url = str(resp.url)
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[Apple HTML] attempt {attempt + 1}/{APPLE_HTTP_RETRIES + 1} failed: {e}")
+                await asyncio.sleep(1.0 * (attempt + 1))
+
+    if not html:
+        logger.warning(f"[Apple HTML] Failed to fetch HTML; fallback to Playwright. last_error={last_error}")
+        return None
+
+    parsed = _parse_apple_html_payload(
+        html,
+        final_url or url,
+        strategy_hint="html",
+        meta_extra={"apple_http_status": status_code, "apple_final_url": final_url or url},
+    )
+    if parsed:
+        logger.info(f"[Apple HTML] Parsed {len(parsed.get('items', []))} tracks from embedded JSON")
+    return parsed
 
 
 async def fetch_playlist_tracks_generic(
