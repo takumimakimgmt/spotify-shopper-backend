@@ -811,8 +811,20 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
 
         blocked_hint = False
 
-        context = await new_context()
-        page = await context.new_page()
+        try:
+            context = await new_context()
+        except Exception as e:
+            err_msg = f"Playwright context creation failed (Chromium not available or browser init error): {str(e)}"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            raise RuntimeError(err_msg)
+        
+        try:
+            page = await context.new_page()
+        except Exception as e:
+            err_msg = f"Playwright page creation failed: {str(e)}"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            await context.close()
+            raise RuntimeError(err_msg)
         page.set_default_navigation_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
         page.set_default_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
 
@@ -1822,13 +1834,17 @@ async def fetch_playlist_tracks_generic(
 
         if not result:
             apple_strategy = "playwright"
+            # Shorter playwright timeout: fail fast instead of 95s
+            apple_playwright_timeout_s = 30
             try:
                 result = await asyncio.wait_for(
                     fetch_apple_playlist_tracks_from_web(url_or_id, app=app, apple_mode=mode),
                     timeout=apple_playwright_timeout_s,
                 )
             except asyncio.TimeoutError:
-                raise RuntimeError(f"Apple Music fetch timed out ({apple_playwright_timeout_s}s)")
+                raise RuntimeError(f"Apple Music Playwright fetch timed out ({apple_playwright_timeout_s}s) - try different URL or wait a few minutes for rate limit reset")
+            except Exception as e:
+                raise RuntimeError(f"Apple Music fetch failed: {str(e)}")
         t1_fetch = time.time()
         perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
 
