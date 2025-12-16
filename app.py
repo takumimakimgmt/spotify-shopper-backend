@@ -72,7 +72,21 @@ class PlaylistMetaModel(BaseModel):
     total_api_ms: Optional[float] = None
     # Apple-specific meta flags
     apple_strategy: Optional[str] = None  # 'html' | 'playwright'
+    apple_mode: Optional[str] = None  # 'auto' | 'fast' | 'legacy'
+    apple_legacy_used: Optional[bool] = None
     apple_enrich_skipped: Optional[bool] = None
+    reason: Optional[str] = None
+    seen_catalog_playlist_api: Optional[bool] = None
+    apple_api_candidates: Optional[list] = None
+    apple_response_candidates: Optional[list] = None
+    apple_request_candidates: Optional[list] = None
+    apple_xhr_fetch_requests: Optional[list] = None
+    json_responses_any_domain: Optional[list] = None
+    apple_console_errors: Optional[list] = None
+    apple_page_errors: Optional[list] = None
+    apple_page_title: Optional[str] = None
+    apple_html_snippet: Optional[str] = None
+    blocked_hint: Optional[bool] = None
 
 
 class PlaylistResponse(BaseModel):
@@ -209,6 +223,7 @@ async def get_playlist(
     request: Request,
     url: str = Query(..., description="Playlist URL or ID or URL"),
     source: str = Query("spotify", description="spotify or apple"),
+    apple_mode: str = Query("auto", description="auto|fast|legacy (Apple only)"),
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
     isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
     enrich_spotify: Optional[int] = Query(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
@@ -226,8 +241,12 @@ async def get_playlist(
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
         src = "apple"
+    # Normalize apple_mode
+    mode = (apple_mode or "auto").lower()
+    if src != "apple":
+        mode = "auto"  # Only meaningful for Apple
 
-    logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} -> using source={src}")
+    logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}")
 
     # Call core directly so we can attach debug info on failure
     try:
@@ -240,10 +259,10 @@ async def get_playlist(
                 effective_enrich_spotify = 0
             else:
                 effective_enrich_spotify = 1 if int(enrich_spotify) == 1 else 0
-        # Include enrich flag in cache key for Apple to avoid mixing
+        # Include enrich flag and mode in cache key for Apple to avoid mixing
         cache_key = f"{src}:{normalized_url}"
         if src == "apple":
-            cache_key = f"{cache_key}:enrich={effective_enrich_spotify}"
+            cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
         bypass = (refresh == 1)
         cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
         cache_hit = (cached is not None)
@@ -254,9 +273,9 @@ async def get_playlist(
                 src,
                 clean_url,
                 app=request.app,
+                apple_mode=mode if src == "apple" else None,
                 enrich_spotify=(bool(effective_enrich_spotify) if effective_enrich_spotify is not None else None),
             )
-        perf = result.get('perf', {})
         
         # Optional ISRC enrichment (best-effort)
         if enrich_isrc and isinstance(result, dict):
@@ -472,6 +491,7 @@ async def playlist_with_rekordbox_upload(
     request: Request,
     url: str = Form(..., description="Playlist URL or ID or URL"),
     source: str = Form("spotify", description="spotify or apple"),
+    apple_mode: str = Form("auto", description="auto|fast|legacy (Apple only)"),
     file: UploadFile | None = File(None, description="Rekordbox collection XML"),
     enrich_spotify: Optional[int] = Form(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
     refresh: Optional[int] = Form(None, description="Bypass cache when set to 1"),
@@ -492,8 +512,12 @@ async def playlist_with_rekordbox_upload(
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
         src = "apple"
+    # Normalize apple_mode
+    mode = (apple_mode or "auto").lower()
+    if src != "apple":
+        mode = "auto"  # Only meaningful for Apple
 
-    logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} -> using source={src}")
+    logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}")
 
     try:
         t0_fetch = time.time()
@@ -506,7 +530,7 @@ async def playlist_with_rekordbox_upload(
                 effective_enrich_spotify = 1 if int(enrich_spotify) == 1 else 0
         cache_key = f"{src}:{normalized_url}"
         if src == "apple":
-            cache_key = f"{cache_key}:enrich={effective_enrich_spotify}"
+            cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
         bypass = (refresh == 1)
         cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
         cache_hit = cached is not None
@@ -517,6 +541,7 @@ async def playlist_with_rekordbox_upload(
                 src,
                 clean_url,
                 app=request.app,
+                apple_mode=mode if src == "apple" else None,
                 enrich_spotify=(bool(effective_enrich_spotify) if effective_enrich_spotify is not None else None),
             )
         t1_fetch = time.time()

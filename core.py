@@ -662,13 +662,11 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None) -> Dict[str, Any]:
+async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None, apple_mode: str = "auto") -> Dict[str, Any]:
     """
-    Playwright with network interception:
-    1. Block heavy resources (images, CSS, fonts, media)
-    2. Listen for Apple Music API JSON responses (broader /v1/catalog/ matches including amp-api)
-    3. Fall back to DOM parsing if network JSON unavailable
-    4. Detect "blocked/JS-required" variants
+    Playwright with network interception (fast) plus optional legacy fallback.
+    apple_mode: auto (default) runs fast, then legacy if fast fails with catalog_api_not_fired/unparsed/unsupported;
+                fast runs only fast path; legacy runs only legacy path.
     """
     if url:
         url = url.strip()
@@ -697,7 +695,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     now = time.time()
     last_ts = last.get(url, 0)
 
-    if url in cache:
+    if url in cache and apple_mode != "legacy":
         return cache[url]
 
     if now - last_ts < 2:
@@ -706,7 +704,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     result: Dict[str, Any] | None = None
     context = None
     page = None
-    meta_base: Dict[str, Any] = {"apple_strategy": "playwright"}
+    meta_base: Dict[str, Any] = {"apple_strategy": "playwright", "apple_mode": apple_mode or "auto"}
     api_response_captured: Dict[str, Any] | None = None
     api_candidates: list[dict] = []
     response_candidates: list[dict] = []
@@ -787,7 +785,24 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         except Exception as e:
             logger.debug(f"[Apple Network] Error in request handler: {e}")
 
-    try:
+    async def run_fast_playwright() -> Dict[str, Any] | None:
+        """Fast Playwright path with safe resource blocking and short waits."""
+        nonlocal context, page, result, meta_base, api_response_captured, api_candidates, response_candidates, xhr_fetch_requests, json_responses_any_domain, request_candidates, console_errors, page_errors, seen_catalog_playlist_api
+        result = None
+
+        # Reset collectors per run
+        api_response_captured = None
+        api_candidates = []
+        response_candidates = []
+        xhr_fetch_requests = []
+        json_responses_any_domain = []
+        request_candidates = []
+        console_errors = []
+        page_errors = []
+        seen_catalog_playlist_api = False
+
+        blocked_hint = False
+
         context = await new_context()
         page = await context.new_page()
         page.set_default_navigation_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
@@ -797,11 +812,9 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         if not APPLE_PW_NO_BLOCK:
             async def route_handler(route):
                 req_type = route.request.resource_type
-                # Super safe: only block truly unnecessary resources
                 if req_type in ("image", "media", "font"):
                     await route.abort()
                 else:
-                    # Allow: document, script, xhr, fetch, stylesheet, etc.
                     await route.continue_()
 
             await page.route("**/*", route_handler)
@@ -815,25 +828,24 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if len(console_errors) < 20 else None)
         page.on("pageerror", lambda err: page_errors.append(str(err)) if len(page_errors) < 20 else None)
 
+        meta_local = {**meta_base, "apple_playwright_phase": "network_json"}
+
         # Commit-stage fetch
         resp = await page.goto(url, wait_until="commit", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
         status = resp.status if resp else None
         final_url = resp.url if resp else url
-        meta_base.update({
-            "apple_http_status": status,
-            "apple_final_url": final_url,
-        })
+        meta_local.update({"apple_http_status": status, "apple_final_url": final_url})
 
         # Capture page title and snippet early for diagnostics
         try:
-            meta_base["apple_page_title"] = await page.title()
+            meta_local["apple_page_title"] = await page.title()
         except Exception:
-            meta_base["apple_page_title"] = None
+            meta_local["apple_page_title"] = None
         try:
             snap_html = await page.content()
-            meta_base["apple_html_snippet"] = (snap_html or "")[:2048]
+            meta_local["apple_html_snippet"] = (snap_html or "")[:2048]
         except Exception:
-            meta_base["apple_html_snippet"] = None
+            meta_local["apple_html_snippet"] = None
 
         # Quick consent/banner handling to unblock API firing
         try:
@@ -873,7 +885,6 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             pass
 
         # Early blocked/consent detection before network wait (extended keyword list)
-        blocked_hint = False
         try:
             page_title = await page.title()
             page_html = await page.content()
@@ -894,7 +905,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             ]
             if any(kw in (page_title or "").lower() + first_2kb for kw in blocked_keywords):
                 blocked_hint = True
-                meta_base["blocked_hint"] = True
+                meta_local["blocked_hint"] = True
                 logger.warning(f"[Apple Network] Detected blocked page variant: {page_title}")
         except Exception:
             pass
@@ -930,7 +941,6 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         if api_response_captured:
             try:
                 body = api_response_captured["body"]
-                # Apple API usually has data.data with attributes/name/artistName
                 tracks, playlist_name = _extract_tracks_from_json_tree(body)
                 if tracks:
                     result = _build_apple_playlist_result(
@@ -938,9 +948,10 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                         playlist_name or "Apple Music Playlist",
                         final_url or url,
                         meta_extra={
-                            **meta_base,
+                            **meta_local,
                             "apple_playwright_phase": "network_json",
                             "apple_api_url": api_response_captured["url"],
+                            "apple_legacy_used": False,
                         },
                     )
                     logger.info(f"[Apple Network] Extracted {len(tracks)} tracks from API response")
@@ -950,7 +961,6 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         # DOM fallback if API response unavailable
         if result is None:
             try:
-                # Short selector wait for track rows visible in UI (5-8s)
                 try:
                     await page.wait_for_selector(
                         'div[role="row"], ol li, .songs-list-row, apple-music-item, .music-item, [data-test-song-row]',
@@ -975,7 +985,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     html_dom,
                     final_url or url,
                     strategy_hint="playwright",
-                    meta_extra={**meta_base, "apple_playwright_phase": "dom_fallback"},
+                    meta_extra={**meta_local, "apple_playwright_phase": "dom_fallback", "apple_legacy_used": False},
                 )
                 if parsed_dom and parsed_dom.get("items"):
                     result = parsed_dom
@@ -1000,16 +1010,12 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     "automated",
                     "bot",
                 ]
-                if any(
-                    kw in (page_title or "").lower() + first_2kb
-                    for kw in blocked_keywords
-                ):
+                if any(kw in (page_title or "").lower() + first_2kb for kw in blocked_keywords):
                     reason = "blocked_variant"
                     logger.info(f"[Apple Network] Detected blocked/JS-required variant: {page_title}")
             except Exception:
                 pass
 
-            # Priority: blocked_hint > detected blocked > unsupported
             meta_reason = reason
             if blocked_hint:
                 meta_reason = "blocked_variant"
@@ -1026,8 +1032,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             raise AppleFetchError(
                 f"Apple page load failed (Playwright, {meta_reason})",
                 meta={
-                    **meta_base,
-                    "apple_playwright_phase": "network_json" if api_response_captured else "dom_fallback",
+                    **meta_local,
                     "reason": meta_reason,
                     "apple_api_candidates": api_candidates[:20],
                     "apple_response_candidates": response_candidates[:20],
@@ -1037,12 +1042,12 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     "apple_console_errors": console_errors[:20],
                     "apple_page_errors": page_errors[:20],
                     "seen_catalog_playlist_api": seen_catalog_playlist_api,
+                    "apple_legacy_used": False,
                 },
             )
 
         # cache and record timestamp
         if result is not None:
-            # Attach full candidate metadata for visibility
             try:
                 result.setdefault("meta", {})
                 result["meta"].setdefault("apple_api_candidates", api_candidates[:20])
@@ -1059,15 +1064,284 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 if page_errors:
                     result["meta"].setdefault("apple_page_errors", page_errors[:20])
                 result["meta"].setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
-                result["meta"].setdefault("apple_page_title", meta_base.get("apple_page_title"))
-                result["meta"].setdefault("apple_html_snippet", meta_base.get("apple_html_snippet"))
+                result["meta"].setdefault("apple_page_title", meta_local.get("apple_page_title"))
+                result["meta"].setdefault("apple_html_snippet", meta_local.get("apple_html_snippet"))
+                result["meta"].setdefault("apple_legacy_used", False)
             except Exception:
                 pass
 
             cache[url] = result
             last[url] = time.time()
-            logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright")
+            logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright (fast)")
             return result
+    
+    async def run_legacy_playwright() -> Dict[str, Any] | None:
+        """Legacy Playwright path with no blocking and longer waits."""
+        nonlocal context, page, result, meta_base, api_response_captured, api_candidates, response_candidates, xhr_fetch_requests, json_responses_any_domain, request_candidates, console_errors, page_errors, seen_catalog_playlist_api
+        result = None
+
+        api_response_captured = None
+        api_candidates = []
+        response_candidates = []
+        xhr_fetch_requests = []
+        json_responses_any_domain = []
+        request_candidates = []
+        console_errors = []
+        page_errors = []
+        seen_catalog_playlist_api = False
+
+        context = await new_context()
+        page = await context.new_page()
+        # Legacy: no blocking, longer timeouts
+        legacy_nav_timeout_ms = max(90000, APPLE_PW_COMMIT_TIMEOUT_MS)
+        legacy_dom_timeout_ms = max(30000, APPLE_PW_DOM_TIMEOUT_MS)
+        legacy_net_wait_ms = max(90000, APPLE_PW_NET_WAIT_MS)
+        page.set_default_navigation_timeout(legacy_nav_timeout_ms)
+        page.set_default_timeout(legacy_nav_timeout_ms)
+
+        # Listen for API responses and requests
+        page.on("response", on_response_handler)
+        page.on("request", on_request_handler)
+        page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if len(console_errors) < 20 else None)
+        page.on("pageerror", lambda err: page_errors.append(str(err)) if len(page_errors) < 20 else None)
+
+        meta_local = {**meta_base, "apple_playwright_phase": "legacy_networkidle", "apple_legacy_used": True}
+
+        # Networkidle navigation
+        resp = await page.goto(url, wait_until="networkidle", timeout=legacy_nav_timeout_ms)
+        status = resp.status if resp else None
+        final_url = resp.url if resp else url
+        meta_local.update({"apple_http_status": status, "apple_final_url": final_url})
+
+        try:
+            meta_local["apple_page_title"] = await page.title()
+        except Exception:
+            meta_local["apple_page_title"] = None
+        try:
+            snap_html = await page.content()
+            meta_local["apple_html_snippet"] = (snap_html or "")[:2048]
+        except Exception:
+            meta_local["apple_html_snippet"] = None
+
+        # Consent / upsell handling
+        try:
+            consent_selectors = [
+                "button:has-text('Accept')",
+                "button:has-text('Agree')",
+                "button:has-text('同意')",
+                "text=同意する",
+                "text=同意します",
+                "text=同意",
+                "text=Accept",
+                "text=Agree",
+                "#onetrust-accept-btn-handler",
+            ]
+            for sel in consent_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    await locator.wait_for(timeout=1000)
+                    await locator.click()
+                    break
+                except Exception:
+                    continue
+            upsell_selectors = [
+                "button[aria-label*='Close']",
+                "button[aria-label*='close']",
+                "button[aria-label*='閉じる']",
+            ]
+            for sel in upsell_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    await loc.wait_for(timeout=1000)
+                    await loc.click()
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Extended wait for track rows and scripts
+        try:
+            await page.wait_for_selector(
+                'div[role="row"], ol li, .songs-list-row, apple-music-item, .music-item, [data-test-song-row]',
+                timeout=legacy_dom_timeout_ms,
+            )
+        except Exception:
+            pass
+        try:
+            await page.wait_for_selector(
+                'script[id="__NEXT_DATA__"], script[type="application/json"], script[type="application/ld+json"]',
+                timeout=legacy_dom_timeout_ms,
+            )
+        except Exception:
+            pass
+
+        # Slow scroll nudges to trigger lazy loading
+        try:
+            for _ in range(3):
+                await page.wait_for_timeout(800)
+                try:
+                    await page.mouse.wheel(0, 1600)
+                except Exception:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
+                await page.wait_for_timeout(800)
+            try:
+                await page.evaluate("window.scrollTo(0, 2000)")
+                await page.wait_for_timeout(500)
+                await page.evaluate("window.scrollTo(0, 0)")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Wait longer for API if it fires late
+        api_wait_start = time.time()
+        while api_response_captured is None:
+            if (time.time() - api_wait_start) * 1000 > legacy_net_wait_ms:
+                break
+            await asyncio.sleep(0.3)
+
+        # Parse API first if available
+        if api_response_captured:
+            try:
+                body = api_response_captured["body"]
+                tracks, playlist_name = _extract_tracks_from_json_tree(body)
+                if tracks:
+                    result = _build_apple_playlist_result(
+                        tracks,
+                        playlist_name or "Apple Music Playlist",
+                        final_url or url,
+                        meta_extra={
+                            **meta_local,
+                            "apple_playwright_phase": "legacy_networkidle",
+                            "apple_api_url": api_response_captured["url"],
+                        },
+                    )
+                    logger.info(f"[Apple Network] Extracted {len(tracks)} tracks from API response (legacy)")
+            except Exception as e:
+                logger.debug(f"[Apple Network] Failed to parse API response (legacy): {e}")
+
+        # DOM parse
+        if result is None:
+            try:
+                html_dom = await page.content()
+            except Exception:
+                html_dom = None
+            if html_dom:
+                parsed_dom = _parse_apple_html_payload(
+                    html_dom,
+                    final_url or url,
+                    strategy_hint="playwright-legacy",
+                    meta_extra={**meta_local, "apple_playwright_phase": "legacy_dom", "apple_legacy_used": True},
+                )
+                if parsed_dom and parsed_dom.get("items"):
+                    result = parsed_dom
+
+        # Failure -> raise with meta
+        if result is None:
+            reason = "no_tracks"
+            if not seen_catalog_playlist_api:
+                reason = "catalog_api_not_fired"
+            elif response_candidates or json_responses_any_domain or xhr_fetch_requests:
+                reason = "catalog_api_unparsed"
+            else:
+                reason = "no_apple_traffic"
+            raise AppleFetchError(
+                "Apple page load failed (legacy)",
+                meta={
+                    **meta_local,
+                    "reason": reason,
+                    "apple_api_candidates": api_candidates[:20],
+                    "apple_response_candidates": response_candidates[:20],
+                    "apple_request_candidates": request_candidates[:20],
+                    "apple_xhr_fetch_requests": xhr_fetch_requests[:10],
+                    "json_responses_any_domain": json_responses_any_domain[:20],
+                    "apple_console_errors": console_errors[:20],
+                    "apple_page_errors": page_errors[:20],
+                    "seen_catalog_playlist_api": seen_catalog_playlist_api,
+                    "apple_legacy_used": True,
+                },
+            )
+
+        if result is not None:
+            try:
+                result.setdefault("meta", {})
+                result["meta"].setdefault("apple_api_candidates", api_candidates[:20])
+                if response_candidates:
+                    result["meta"].setdefault("apple_response_candidates", response_candidates[:20])
+                if request_candidates:
+                    result["meta"].setdefault("apple_request_candidates", request_candidates[:20])
+                if xhr_fetch_requests:
+                    result["meta"].setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
+                if json_responses_any_domain:
+                    result["meta"].setdefault("json_responses_any_domain", json_responses_any_domain[:20])
+                if console_errors:
+                    result["meta"].setdefault("apple_console_errors", console_errors[:20])
+                if page_errors:
+                    result["meta"].setdefault("apple_page_errors", page_errors[:20])
+                result["meta"].setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
+                result["meta"].setdefault("apple_page_title", meta_local.get("apple_page_title"))
+                result["meta"].setdefault("apple_html_snippet", meta_local.get("apple_html_snippet"))
+                result["meta"].setdefault("apple_legacy_used", True)
+            except Exception:
+                pass
+
+            cache[url] = result
+            last[url] = time.time()
+            logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright (legacy)")
+            return result
+    
+    fast_error: AppleFetchError | None = None
+    legacy_error: AppleFetchError | None = None
+    try:
+        # Fast path first unless mode forces legacy
+        if apple_mode in ("auto", "fast"):
+            try:
+                fast_result = await run_fast_playwright()
+                if fast_result:
+                    return fast_result
+            except AppleFetchError as e:
+                fast_error = e
+                result = None
+                try:
+                    if context:
+                        await context.close()
+                except Exception:
+                    pass
+                context = None
+                page = None
+
+        should_try_legacy = apple_mode == "legacy"
+        if apple_mode == "auto" and fast_error:
+            fast_reason = (fast_error.meta or {}).get("reason") if isinstance(fast_error, AppleFetchError) else None
+            fallback_reasons = {
+                "catalog_api_not_fired",
+                "catalog_api_unparsed",
+                "unsupported_playlist_variant",
+                "blocked_variant",
+                "no_tracks",
+                "no_apple_traffic",
+            }
+            if fast_reason in fallback_reasons or not (fast_error.meta or {}).get("seen_catalog_playlist_api"):
+                should_try_legacy = True
+
+        if should_try_legacy:
+            try:
+                legacy_result = await run_legacy_playwright()
+                if legacy_result:
+                    # Mark that legacy was used even if fast previously failed
+                    legacy_result.setdefault("meta", {})
+                    legacy_result["meta"].setdefault("apple_legacy_used", True)
+                    return legacy_result
+            except AppleFetchError as e:
+                legacy_error = e
+
+        # If we reach here, propagate the most relevant error
+        if legacy_error:
+            raise legacy_error
+        if fast_error:
+            raise fast_error
+        raise AppleFetchError("Apple page load failed", meta=meta_base)
     finally:
         try:
             if context:
@@ -1496,6 +1770,7 @@ async def fetch_playlist_tracks_generic(
     source: str,
     url_or_id: str,
     app: Any | None = None,
+    apple_mode: str | None = None,
     enrich_spotify: bool | None = None,
 ) -> Dict[str, Any]:
     """
@@ -1519,6 +1794,7 @@ async def fetch_playlist_tracks_generic(
         apple_playwright_timeout_s = 95
         apple_strategy = "html"
         result: Dict[str, Any] | None = None
+        mode = (apple_mode or "auto").lower()
 
         # HTTP-first attempt
         try:
@@ -1533,7 +1809,7 @@ async def fetch_playlist_tracks_generic(
             apple_strategy = "playwright"
             try:
                 result = await asyncio.wait_for(
-                    fetch_apple_playlist_tracks_from_web(url_or_id, app=app),
+                    fetch_apple_playlist_tracks_from_web(url_or_id, app=app, apple_mode=mode),
                     timeout=apple_playwright_timeout_s,
                 )
             except asyncio.TimeoutError:
