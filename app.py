@@ -25,6 +25,7 @@ from core import (
 )
 from core import _PLAYLIST_CACHE as PLAYLIST_CACHE  # TTLCache
 from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
+from core import _CACHE_VERSION as CACHE_VERSION
 from rekordbox import mark_owned_tracks
 import logging
 import json
@@ -63,6 +64,8 @@ class TrackModel(BaseModel):
 
 
 class PlaylistMetaModel(BaseModel):
+    model_config = {"extra": "allow"}  # Allow unknown fields to pass through
+    
     cache_hit: Optional[bool] = None
     cache_ttl_s: Optional[int] = None
     refresh: Optional[int] = None
@@ -260,7 +263,7 @@ async def get_playlist(
             else:
                 effective_enrich_spotify = 1 if int(enrich_spotify) == 1 else 0
         # Include enrich flag and mode in cache key for Apple to avoid mixing
-        cache_key = f"{src}:{normalized_url}"
+        cache_key = f"{CACHE_VERSION}:{src}:{normalized_url}"
         if src == "apple":
             cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
         bypass = (refresh == 1)
@@ -528,7 +531,7 @@ async def playlist_with_rekordbox_upload(
                 effective_enrich_spotify = 0
             else:
                 effective_enrich_spotify = 1 if int(enrich_spotify) == 1 else 0
-        cache_key = f"{src}:{normalized_url}"
+        cache_key = f"{CACHE_VERSION}:{src}:{normalized_url}"
         if src == "apple":
             cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
         bypass = (refresh == 1)
