@@ -14,6 +14,7 @@ from fastapi import (
     Form,
     Request,
 )
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -119,6 +120,23 @@ app = FastAPI(
 # Add GZip middleware for response compression (reduces payload size for large JSON)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+# Add request body size limit middleware (protect against extremely large payloads)
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ("POST", "PUT", "PATCH"):
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > 25 * 1024 * 1024:  # 25MB ceiling
+                logger.warning(f"[RequestSizeLimit] Rejected oversized request: {content_length} bytes from {request.client}")
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large (max 25MB)"}
+                )
+        return await call_next(request)
+
+app.add_middleware(RequestSizeLimitMiddleware)
+
 @app.on_event("startup")
 def _log_startup():
     logger.info("spotify-shopper: startup event triggered")
@@ -139,8 +157,8 @@ async def _shutdown_playwright_state():
     except Exception:
         pass
 
-# 最大アップロードサイズ（バイト） - デフォルト 5MB
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 5 * 1024 * 1024))
+# 最大アップロードサイズ（バイト） - デフォルト 20MB（フロントと合わせて）
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 20 * 1024 * 1024))
 
 # デフォルトの許可オリジン
 default_origins = [
