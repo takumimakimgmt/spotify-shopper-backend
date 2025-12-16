@@ -713,10 +713,13 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
     xhr_fetch_requests: list[dict] = []
     json_responses_any_domain: list[dict] = []
     request_candidates: list[dict] = []
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+    seen_catalog_playlist_api = False
 
     async def on_response_handler(response):
         """Capture Apple Music API JSON responses."""
-        nonlocal api_response_captured
+        nonlocal api_response_captured, seen_catalog_playlist_api
         try:
             url_str = response.url
             status = response.status
@@ -736,6 +739,7 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 match_api = True
 
             if match_api:
+                seen_catalog_playlist_api = True
                 if len(api_candidates) < 20:
                     api_candidates.append({"url": url_str, "status": status})
                 if (
@@ -760,8 +764,11 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
 
     async def on_request_handler(request):
         """Track outgoing Apple domain requests."""
+        nonlocal seen_catalog_playlist_api
         try:
             url_str = request.url
+            if "/v1/catalog/" in url_str and "/playlists" in url_str:
+                seen_catalog_playlist_api = True
             if any(host in url_str for host in ["music.apple.com", "amp-api.music.apple.com"]):
                 if len(request_candidates) < 20:
                     request_candidates.append({
@@ -805,6 +812,8 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
         # Listen for API responses and requests
         page.on("response", on_response_handler)
         page.on("request", on_request_handler)
+        page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if len(console_errors) < 20 else None)
+        page.on("pageerror", lambda err: page_errors.append(str(err)) if len(page_errors) < 20 else None)
 
         # Commit-stage fetch
         resp = await page.goto(url, wait_until="commit", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
@@ -814,6 +823,17 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             "apple_http_status": status,
             "apple_final_url": final_url,
         })
+
+        # Capture page title and snippet early for diagnostics
+        try:
+            meta_base["apple_page_title"] = await page.title()
+        except Exception:
+            meta_base["apple_page_title"] = None
+        try:
+            snap_html = await page.content()
+            meta_base["apple_html_snippet"] = (snap_html or "")[:2048]
+        except Exception:
+            meta_base["apple_html_snippet"] = None
 
         # Quick consent/banner handling to unblock API firing
         try:
@@ -826,12 +846,26 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 "text=同意",
                 "text=Accept",
                 "text=Agree",
+                "#onetrust-accept-btn-handler",
             ]
             for sel in consent_selectors:
                 try:
                     locator = page.locator(sel).first
                     await locator.wait_for(timeout=800)
                     await locator.click()
+                    break
+                except Exception:
+                    continue
+            upsell_selectors = [
+                "button[aria-label*='Close']",
+                "button[aria-label*='close']",
+                "button[aria-label*='閉じる']",
+            ]
+            for sel in upsell_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    await loc.wait_for(timeout=800)
+                    await loc.click()
                     break
                 except Exception:
                     continue
@@ -874,6 +908,12 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                 except Exception:
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
                 await page.wait_for_timeout(500)
+            try:
+                await page.evaluate("window.scrollTo(0, 1000)")
+                await page.wait_for_timeout(200)
+                await page.evaluate("window.scrollTo(0, 0)")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -976,9 +1016,10 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
             elif reason == "blocked_variant":
                 meta_reason = "blocked_variant"
             elif reason == "no_tracks":
-                # Only mark as unsupported if we have Apple responses but no tracks
-                if response_candidates or json_responses_any_domain or xhr_fetch_requests:
-                    meta_reason = "unsupported_playlist_variant"
+                if not seen_catalog_playlist_api:
+                    meta_reason = "catalog_api_not_fired"
+                elif response_candidates or json_responses_any_domain or xhr_fetch_requests:
+                    meta_reason = "catalog_api_unparsed"
                 else:
                     meta_reason = "no_apple_traffic"
 
@@ -993,6 +1034,9 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     "apple_request_candidates": request_candidates[:20],
                     "apple_xhr_fetch_requests": xhr_fetch_requests[:10],
                     "json_responses_any_domain": json_responses_any_domain[:20],
+                    "apple_console_errors": console_errors[:20],
+                    "apple_page_errors": page_errors[:20],
+                    "seen_catalog_playlist_api": seen_catalog_playlist_api,
                 },
             )
 
@@ -1010,6 +1054,13 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None)
                     result["meta"].setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
                 if json_responses_any_domain:
                     result["meta"].setdefault("json_responses_any_domain", json_responses_any_domain[:20])
+                if console_errors:
+                    result["meta"].setdefault("apple_console_errors", console_errors[:20])
+                if page_errors:
+                    result["meta"].setdefault("apple_page_errors", page_errors[:20])
+                result["meta"].setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
+                result["meta"].setdefault("apple_page_title", meta_base.get("apple_page_title"))
+                result["meta"].setdefault("apple_html_snippet", meta_base.get("apple_html_snippet"))
             except Exception:
                 pass
 
