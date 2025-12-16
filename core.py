@@ -33,6 +33,7 @@ _CACHE_VERSION = "v2"  # v2: includes apple_mode in cache keys
 _PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=_TTL_SECONDS)
 APPLE_HTTP_TIMEOUT_S = float(os.getenv("APPLE_HTTP_TIMEOUT_S", "20"))
 APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
+APPLE_PLAYWRIGHT_TIMEOUT_S = float(os.getenv("APPLE_PLAYWRIGHT_TIMEOUT_S", "95"))
 APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
 APPLE_PW_COMMIT_TIMEOUT_MS = int(os.getenv("APPLE_PW_COMMIT_TIMEOUT_MS", "20000"))
 APPLE_PW_DOM_TIMEOUT_MS = int(os.getenv("APPLE_PW_DOM_TIMEOUT_MS", "7000"))
@@ -1818,7 +1819,6 @@ async def fetch_playlist_tracks_generic(
     
     if src == "apple":
         t0_fetch = time.time()
-        apple_playwright_timeout_s = 95
         apple_strategy = "html"
         result: Dict[str, Any] | None = None
         mode = (apple_mode or "auto").lower()
@@ -1834,15 +1834,13 @@ async def fetch_playlist_tracks_generic(
 
         if not result:
             apple_strategy = "playwright"
-            # Shorter playwright timeout: fail fast instead of 95s
-            apple_playwright_timeout_s = 30
             try:
                 result = await asyncio.wait_for(
                     fetch_apple_playlist_tracks_from_web(url_or_id, app=app, apple_mode=mode),
-                    timeout=apple_playwright_timeout_s,
+                    timeout=APPLE_PLAYWRIGHT_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
-                raise RuntimeError(f"Apple Music Playwright fetch timed out ({apple_playwright_timeout_s}s) - try different URL or wait a few minutes for rate limit reset")
+                raise RuntimeError(f"Apple Music Playwright fetch timed out ({APPLE_PLAYWRIGHT_TIMEOUT_S}s) - try different URL or wait a few minutes for rate limit reset")
             except Exception as e:
                 raise RuntimeError(f"Apple Music fetch failed: {str(e)}")
         t1_fetch = time.time()
