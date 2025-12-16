@@ -15,6 +15,7 @@ from fastapi import (
     Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 from core import (
@@ -115,6 +116,8 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Add GZip middleware for response compression (reduces payload size for large JSON)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.on_event("startup")
 def _log_startup():

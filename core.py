@@ -465,7 +465,14 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     results = None
     for market in markets:
         try:
-            results = sp.playlist_tracks(playlist_id, limit=100, offset=0, market=market)
+            # Fetch only necessary fields to reduce payload size and improve latency
+            results = sp.playlist_tracks(
+                playlist_id,
+                limit=100,
+                offset=0,
+                market=market,
+                fields="items(track(id,name,artists(name),external_urls.spotify,is_local,external_ids.isrc,album(name))),next"
+            )
             items.extend(results.get("items", []))
             # paginate
             while results.get("next"):
@@ -1510,7 +1517,14 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     by searching Spotify for matching tracks.
     
     This preserves Apple's original artist/album/URL metadata completely.
+    
+    NOTE: ISRC enrichment is skipped by default (1-by-1 search is too slow ~200ms/track).
+    Set APPLE_ENRICH_ISRC=1 env var to enable.
     """
+    # Skip ISRC enrichment for performance (can be re-enabled via env var if needed)
+    if not os.getenv("APPLE_ENRICH_ISRC", "").lower() in ("1", "true", "yes"):
+        return result
+    
     try:
         sp = get_spotify_client()
     except Exception:
