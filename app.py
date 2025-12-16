@@ -28,7 +28,7 @@ from core import (
 from core import _PLAYLIST_CACHE as PLAYLIST_CACHE  # TTLCache
 from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
 from core import _CACHE_VERSION as CACHE_VERSION
-from rekordbox import mark_owned_tracks
+from lib.rekordbox import mark_owned_tracks
 import logging
 import json
 from playwright_pool import close_browser

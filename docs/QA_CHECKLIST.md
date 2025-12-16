@@ -156,3 +156,14 @@
 | Analyze ボタンが何回も有効に | AbortController ガードが壊れた | `requestIdRef` の更新ロジック確認 |
 | バー2本出ている | ProcessingBar が重複レンダー | `page.tsx` で duplicate <div> 確認 |
 | キャンセル後に結果が混在 | `finally` の requestId チェック漏れ | `handleAnalyze` の finally ブロック確認 |
+| XML size exceeds limit | ファイルが 20MB を超えている | Rekordbox から小さい範囲で XML エクスポート（docs/REKORDBOX_XML_LIMITS.md 参照） |
+
+---
+
+## XML サイズ制限
+
+- **上限**: 20 MB
+- **理由**: メモリ効率とパフォーマンス（~20,000 曲対応）
+- **エラー時の対応**: Rekordbox から個別プレイリストまたは小範囲の XML をエクスポート
+- **詳細**: `docs/REKORDBOX_XML_LIMITS.md` 参照
+

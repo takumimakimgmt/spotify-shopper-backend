@@ -535,7 +535,7 @@ def _generate_track_key_fallback(title: str, artist: str, album: str | None = No
     Escapes pipe and backslash characters to prevent delimiter collision.
     Safe to split by '|' for reconstruction.
     """
-    from rekordbox import normalize_title_base, normalize_artist, normalize_album
+    from lib.rekordbox.normalizer import normalize_title_base, normalize_artist, normalize_album
     
     def _sanitize_field(s: str) -> str:
         """Escape delimiter characters for track_key safety"""
