@@ -293,6 +293,7 @@ async def get_playlist(
                 pass
         
         data = playlist_result_to_dict(result)
+        perf = result.get("perf", {}) if isinstance(result, dict) else {}
         
         # Log performance metrics
         t1_total = time.time()
