@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 from pathlib import Path
+import time
 
 from lib.rekordbox.models import (
     RekordboxLibrary,
@@ -49,6 +50,7 @@ def mark_owned_tracks(
     Returns:
         Modified playlist_data with 'owned' and 'owned_detail' added to each track
     """
+    t0_match = time.time()
     lib = load_rekordbox_library_xml(rekordbox_xml_path)
     fuzzy_count = 0
 
@@ -131,3 +133,15 @@ def mark_owned_tracks(
         t["owned_detail"] = owned_detail
         # 後方互換性: owned_reason フィールドも設定
         t["owned_reason"] = owned_detail.get("method")
+
+    match_ms = int((time.time() - t0_match) * 1000)
+    track_total = len(playlist_data.get("tracks", []))
+    print(f"[rekordbox] match tracks={track_total} fuzzy={fuzzy_count} match_ms={match_ms}ms")
+
+    playlist_data.setdefault("meta", {})["rekordbox"] = {
+        "track_total": track_total,
+        "fuzzy_count": fuzzy_count,
+        "match_ms": match_ms,
+    }
+
+    return playlist_data

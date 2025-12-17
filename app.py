@@ -123,15 +123,21 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # Add request body size limit middleware (protect against extremely large payloads)
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# Allow slightly larger than XML limit to account for multipart overhead (fields + boundaries)
+REQUEST_SIZE_LIMIT_BYTES = int(os.getenv("REQUEST_SIZE_LIMIT_BYTES", str(70 * 1024 * 1024)))
+
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method in ("POST", "PUT", "PATCH"):
             content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > 25 * 1024 * 1024:  # 25MB ceiling
-                logger.warning(f"[RequestSizeLimit] Rejected oversized request: {content_length} bytes from {request.client}")
+            if content_length and int(content_length) > REQUEST_SIZE_LIMIT_BYTES:
+                logger.warning(
+                    f"[RequestSizeLimit] Rejected oversized request: {content_length} bytes from {request.client}"
+                )
+                max_mb = REQUEST_SIZE_LIMIT_BYTES / (1024 * 1024)
                 return JSONResponse(
                     status_code=413,
-                    content={"detail": "Request body too large (max 25MB)"}
+                    content={"detail": f"Request body too large (max {max_mb:.0f}MB)"}
                 )
         return await call_next(request)
 
@@ -157,8 +163,8 @@ async def _shutdown_playwright_state():
     except Exception:
         pass
 
-# 最大アップロードサイズ（バイト） - デフォルト 20MB（フロントと合わせて）
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 20 * 1024 * 1024))
+# 最大アップロードサイズ（バイト） - デフォルト 50MB（フロントと合わせて）
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 50 * 1024 * 1024))
 
 # デフォルトの許可オリジン
 default_origins = [
@@ -408,7 +414,7 @@ async def match_snapshot_with_xml(
 
     制限：
     - snapshot: 最大 1MB
-    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 5MB）
+    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 50MB）
     """
     # サイズチェック（snapshot 文字列長）
     if snapshot is None:

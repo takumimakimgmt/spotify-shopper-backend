@@ -7,8 +7,8 @@ import os
 import xml.etree.ElementTree as ET
 import time as time_module
 from pathlib import Path
-from cachetools import TTLCache
 
+from lib.cache_manager import get_rekordbox_cache, build_rekordbox_cache_key
 from lib.rekordbox.models import RekordboxLibrary, RekordboxTrack
 from lib.rekordbox.normalizer import (
     normalize_artist,
@@ -18,12 +18,8 @@ from lib.rekordbox.normalizer import (
 )
 
 
-# XML ファイルサイズ上限（環境変数で設定可能、デフォルト: 20 MB）
-MAX_XML_SIZE_BYTES = int(os.getenv("REKORDBOX_MAX_XML_MB", "20")) * 1024 * 1024
-
-# In-memory cache for parsed Rekordbox libraries (TTL: 10 minutes)
-_rekordbox_cache: TTLCache = TTLCache(maxsize=10, ttl=600)
-
+# XML ファイルサイズ上限（環境変数で設定可能、デフォルト: 50 MB）
+MAX_XML_SIZE_BYTES = int(os.getenv("REKORDBOX_MAX_XML_MB", "50")) * 1024 * 1024
 
 def _get_file_hash(path: Path) -> str:
     """Use file size and mtime as a cheap cache key."""
@@ -46,7 +42,7 @@ def load_rekordbox_library_xml(
         FileNotFoundError: XML file not found
         ValueError: Invalid XML structure
         TimeoutError: Parsing exceeded timeout
-        OverflowError: File size exceeds 20 MB limit
+        OverflowError: File size exceeds configured MB limit
 
     Returns:
         RekordboxLibrary with indexed tracks
@@ -68,8 +64,9 @@ def load_rekordbox_library_xml(
     t0 = time_module.time()
 
     # Cache lookup
-    cache_key = _get_file_hash(path)
-    cached = _rekordbox_cache.get(cache_key)
+    cache_key = build_rekordbox_cache_key(_get_file_hash(path))
+    cache = get_rekordbox_cache()
+    cached = cache.get(cache_key)
     if cached:
         return cached
 
@@ -94,12 +91,15 @@ def load_rekordbox_library_xml(
     by_title_artist: dict[tuple[str, str], list[RekordboxTrack]] = {}
     by_artist_norm: dict[str, list[RekordboxTrack]] = {}
     by_title_album: dict[tuple[str, str], list[RekordboxTrack]] = {}
+    track_count = 0
+    t_index_start = time_module.time()
 
     for track_elem in collection.findall("TRACK"):
         title = (track_elem.get("Name") or "").strip()
         artist = (track_elem.get("Artist") or "").strip()
         album = (track_elem.get("Album") or "").strip()
         isrc = track_elem.get("ISRC")
+        track_count += 1
 
         title_norm = normalize_title_base(title)
         artist_norm = normalize_artist(artist)
@@ -133,6 +133,8 @@ def load_rekordbox_library_xml(
             key2 = (title_norm, album_norm)
             by_title_album.setdefault(key2, []).append(info)
 
+    index_ms = int((time_module.time() - t_index_start) * 1000)
+
     library = RekordboxLibrary(
         by_isrc=by_isrc,
         by_title_artist=by_title_artist,
@@ -141,6 +143,10 @@ def load_rekordbox_library_xml(
     )
 
     # Cache the parsed library
-    _rekordbox_cache[cache_key] = library
+    cache[cache_key] = library
+    print(
+        f"[rekordbox] index tracks={track_count} size_mb={xml_mb:.1f} size_bytes={int(xml_bytes)} "
+        f"parse_ms={parse_ms} index_ms={index_ms}"
+    )
 
     return library
