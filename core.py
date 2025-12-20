@@ -9,7 +9,24 @@ Spotify プレイリストを取得して、
 """
 
 from __future__ import annotations
+from time import perf_counter
 
+def _finalize_timings(timings: dict, overall_start: float, post_start: float | None = None) -> dict:
+    now = perf_counter()
+    timings["overall_ms"] = int((now - overall_start) * 1000)
+    if post_start is not None:
+        timings["post_ms"] = int((now - post_start) * 1000)
+    # int(ms) normalize
+    for k, v in list(timings.items()):
+        try:
+            timings[k] = int(v)
+        except Exception:
+            timings[k] = 0
+    # residual
+    known_keys = ["setup_ms","goto_ms","wait_ms","wait_tracks_ms","scroll_ms","api_wait_ms","content_ms","extract_ms","dom_parse_ms","post_ms"]
+    known = sum(int(timings.get(k, 0) or 0) for k in known_keys)
+    timings["other_ms"] = max(0, int(timings.get("overall_ms", 0)) - known)
+    return timings
 import os
 import re
 import urllib.parse
@@ -25,6 +42,7 @@ import json
 import time
 from cachetools import TTLCache
 from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
+from datetime import datetime
 
 # Global TTL cache for playlist fetch results
 _ENV = os.getenv("ENV", "prod").lower()
@@ -35,10 +53,16 @@ APPLE_HTTP_TIMEOUT_S = float(os.getenv("APPLE_HTTP_TIMEOUT_S", "20"))
 APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
 APPLE_PLAYWRIGHT_TIMEOUT_S = float(os.getenv("APPLE_PLAYWRIGHT_TIMEOUT_S", "95"))
 APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
+APPLE_DEBUG = os.getenv("APPLE_DEBUG", "0") == "1"
+APPLE_ARTIFACTS = os.getenv("APPLE_ARTIFACTS", "0") == "1"
 APPLE_PW_COMMIT_TIMEOUT_MS = int(os.getenv("APPLE_PW_COMMIT_TIMEOUT_MS", "20000"))
 APPLE_PW_DOM_TIMEOUT_MS = int(os.getenv("APPLE_PW_DOM_TIMEOUT_MS", "7000"))
 APPLE_PW_NET_WAIT_MS = int(os.getenv("APPLE_PW_NET_WAIT_MS", "35000"))
 APPLE_PW_NO_BLOCK = os.getenv("APPLE_PW_NO_BLOCK", "0") == "1"
+APPLE_DOM_WAIT_MS = int(os.getenv("APPLE_DOM_WAIT_MS", "25000"))
+APPLE_DOM_SCROLL_MAX_ITERS = int(os.getenv("APPLE_DOM_SCROLL_MAX_ITERS", "12"))
+APPLE_DOM_SCROLL_STABLE_ROUNDS = int(os.getenv("APPLE_DOM_SCROLL_STABLE_ROUNDS", "2"))
+APPLE_DOM_SCROLL_PAUSE_MS = int(os.getenv("APPLE_DOM_SCROLL_PAUSE_MS", "500"))
 
 def normalize_playlist_url(url: str) -> str:
     """Normalize playlist URL for canonical cache key.
@@ -433,26 +457,35 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
             playlist_id,
             fields="id,name,external_urls,owner.id",
         )
-    except SpotifyException as e:
-        status = getattr(e, "http_status", None)
-        msg = getattr(e, "msg", str(e))
-        if status in (403, 404):
-            # Private/personalized or region-restricted editorial
-            editorial_hint = ""
-            try:
-                if re.match(r"^37i9", playlist_id or ""):
-                    editorial_hint = (
-                        " It may be an official editorial playlist (ID starts with 37i9) and region-restricted. "
-                        "Workaround: Create a new public playlist in your account and copy all tracks, then use that URL."
-                    )
-            except Exception:
-                pass
-            raise RuntimeError(
-                "Failed to fetch this playlist from Spotify API ({}). "
-                "This may be a private or personalized playlist (e.g., Daily Mix / On Repeat / Blend) requiring user authentication, "
-                "or region-restricted.{} Original error: {}".format(status, editorial_hint, msg)
+    except Exception as e:
+        status = getattr(e, "http_status", None) or getattr(e, "status", None)
+        msg = str(e)
+
+        editorial_hint = ""
+        if str(playlist_id).startswith("37i9"):
+            editorial_hint = (
+                "\n\n---\n\n"
+                "This is an official Spotify editorial playlist (ID starts with 37i9).\n"
+                "Official playlists may be region-restricted and unavailable via API.\n\n"
+                "Workaround:\n"
+                "1. Create a new public playlist in your Spotify account\n"
+                "2. Copy all tracks from this playlist\n"
+                "3. Use the new playlist URL instead"
             )
-        raise RuntimeError(f"Failed to fetch playlist metadata: {msg}")
+
+        raise RuntimeError(
+            f"Failed to fetch this playlist from Spotify API ({status}). "
+            "This may be a private or personalized playlist (e.g., Daily Mix / On Repeat / Blend) requiring user authentication, "
+            f"or region-restricted.{editorial_hint} Original error: {msg}"
+        ) from e
+
+    # debug log（playlistはdict想定）
+    try:
+        _url = ((playlist.get("external_urls") or {}).get("spotify")) if isinstance(playlist, dict) else None
+        logger.debug(f"[Spotify] playlist fetched id={playlist.get('id') if isinstance(playlist, dict) else None} url={_url}")
+    except Exception:
+        pass
+    # ...existing code...
 
     # トラック全件（100曲以上にも対応）。市場（market）を指定して可用性差異に対応。
     owner_id = (playlist.get("owner") or {}).get("id") if isinstance(playlist.get("owner"), dict) else None
@@ -535,7 +568,7 @@ def _generate_track_key_fallback(title: str, artist: str, album: str | None = No
     Escapes pipe and backslash characters to prevent delimiter collision.
     Safe to split by '|' for reconstruction.
     """
-    from rekordbox import normalize_title_base, normalize_artist, normalize_album
+    from lib.rekordbox.normalizer import normalize_title_base, normalize_artist, normalize_album
     
     def _sanitize_field(s: str) -> str:
         """Escape delimiter characters for track_key safety"""
@@ -723,6 +756,76 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
     console_errors: list[str] = []
     page_errors: list[str] = []
     seen_catalog_playlist_api = False
+    DEBUG_META_KEYS = {
+        "apple_api_candidates",
+        "apple_response_candidates",
+        "apple_request_candidates",
+        "apple_xhr_fetch_requests",
+        "json_responses_any_domain",
+        "apple_console_errors",
+        "apple_page_errors",
+        "apple_row_count_progression",
+        "apple_row_count_final",
+        "apple_row_count_iters",
+        "apple_last_track_key_progression",
+        "apple_unique_track_keys_progression",
+        "apple_last_row_text_progression",
+        "apple_tracklist_selector",
+        "apple_page_title",
+        "apple_html_snippet",
+        "apple_timing",
+    }
+
+    def _apply_debug_filter(meta: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        if meta is None:
+            return None
+        if APPLE_DEBUG:
+            return meta
+        for key in DEBUG_META_KEYS:
+            meta.pop(key, None)
+        return meta
+
+    def _set_debug_meta(meta: Dict[str, Any], key: str, value: Any) -> None:
+        if APPLE_DEBUG and value is not None:
+            meta[key] = value
+
+    async def _save_apple_failure_artifacts(page_obj, phase: str, final_url_val: str, err_msg: str | None, meta: Dict[str, Any] | None):
+        if not APPLE_ARTIFACTS:
+            return
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = f"/tmp/apple_fail_{ts}"
+            os.makedirs(base, exist_ok=True)
+            try:
+                await page_obj.screenshot(path=f"{base}/screenshot.png", full_page=True)
+            except Exception:
+                pass
+            try:
+                html = await page_obj.content()
+                with open(f"{base}/page.html", "w", encoding="utf-8") as f:
+                    f.write(html or "")
+            except Exception:
+                pass
+            try:
+                title = None
+                try:
+                    title = await page_obj.title()
+                except Exception:
+                    title = None
+                payload = {
+                    "phase": phase,
+                    "url": final_url_val,
+                    "title": title,
+                    "error": err_msg,
+                    "meta": _apply_debug_filter(meta or {}) or {},
+                }
+                with open(f"{base}/meta.json", "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            logger.info(f"[Apple Debug] Saved failure artifacts to {base}")
+        except Exception:
+            pass
 
     async def on_response_handler(response):
         """Capture Apple Music API JSON responses."""
@@ -738,11 +841,9 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
             if "application/json" in (ct or "").lower():
                 if len(json_responses_any_domain) < 20:
                     json_responses_any_domain.append({"url": url_str, "status": status, "content_type": ct})
-            # Match broader Apple Music API patterns (amp-api, music.apple.com)
+            # Match broader Apple Music API patterns (looser: catalog and playlists in URL)
             match_api = False
-            if "/v1/catalog/" in url_str and "/playlists" in url_str:
-                match_api = True
-            if "amp-api.music.apple.com" in url_str and "/v1/catalog/" in url_str:
+            if ("catalog" in url_str and "playlists" in url_str):
                 match_api = True
 
             if match_api:
@@ -763,7 +864,8 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
                                 "url": url_str,
                                 "status": status,
                             }
-                            logger.info(f"[Apple Network] Captured API response from {url_str}")
+                            # log top-level keys for debug
+                            logger.info(f"[Apple API] candidate url={url_str} keys={list(body.keys())[:8]}")
                     except Exception as e:
                         logger.debug(f"[Apple Network] Failed to parse API response: {e}")
         except Exception as e:
@@ -794,12 +896,31 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
         except Exception as e:
             logger.debug(f"[Apple Network] Error in request handler: {e}")
 
+    from time import perf_counter
+    from typing import Optional, Dict
+
+    # --- Always initialize timing variables at function scope ---
+    timings: Dict[str, float] = {
+        "pre_goto_ms": 0.0,
+        "setup_ms": 0.0,
+        "goto_ms": 0.0,
+        "wait_ms": 0.0,
+        "scroll_ms": 0.0,
+        "extract_ms": 0.0,
+        "post_ms": 0.0,
+        "overall_ms": 0.0,
+        "other_ms": 0.0,
+    }
+    overall_start = perf_counter()
+    scroll_start: Optional[float] = None
+
     async def run_fast_playwright() -> Dict[str, Any] | None:
         """Fast Playwright path with safe resource blocking and short waits."""
         nonlocal context, page, result, meta_base, api_response_captured, api_candidates, response_candidates, xhr_fetch_requests, json_responses_any_domain, request_candidates, console_errors, page_errors, seen_catalog_playlist_api
-        result = None
 
-        # Reset collectors per run
+
+        result = None
+        meta_local = {}
         api_response_captured = None
         api_candidates = []
         response_candidates = []
@@ -809,23 +930,33 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
         console_errors = []
         page_errors = []
         seen_catalog_playlist_api = False
-
         blocked_hint = False
 
+        # --- Timing: setup_start ---
+        setup_start = perf_counter()
         try:
             context = await new_context()
         except Exception as e:
             err_msg = f"Playwright context creation failed (Chromium not available or browser init error): {str(e)}"
             logger.error(f"[Apple Playwright] {err_msg}")
-            raise RuntimeError(err_msg)
-        
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "context_creation_failed"})
+        if context is None:
+            err_msg = "Playwright new_context() returned None"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "context_is_none"})
+
         try:
             page = await context.new_page()
         except Exception as e:
             err_msg = f"Playwright page creation failed: {str(e)}"
             logger.error(f"[Apple Playwright] {err_msg}")
             await context.close()
-            raise RuntimeError(err_msg)
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "page_creation_failed"})
+        if page is None:
+            await context.close()
+            err_msg = "Playwright page creation returned None"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "page_is_none"})
         page.set_default_navigation_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
         page.set_default_timeout(APPLE_PW_COMMIT_TIMEOUT_MS)
 
@@ -837,38 +968,221 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
                     await route.abort()
                 else:
                     await route.continue_()
-
             await page.route("**/*", route_handler)
             logger.info("[Apple Network] Resource blocking enabled (safe mode: image/media/font only)")
         else:
             logger.info("[Apple Network] Resource blocking DISABLED (APPLE_PW_NO_BLOCK=1)")
 
-        # Listen for API responses and requests
+        # Register network listeners BEFORE page.goto() to capture API responses
         page.on("response", on_response_handler)
         page.on("request", on_request_handler)
         page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if len(console_errors) < 20 else None)
         page.on("pageerror", lambda err: page_errors.append(str(err)) if len(page_errors) < 20 else None)
 
-        meta_local = {**meta_base, "apple_playwright_phase": "network_json"}
+        meta_local = {**meta_base, "apple_playwright_phase": "dom_first_strategy"}
+        # --- Timing: setup_ms ---
+        setup_end = perf_counter()
+        timings["setup_ms"] = int((setup_end - setup_start) * 1000)
 
-        # Commit-stage fetch
-        resp = await page.goto(url, wait_until="commit", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
+        goto_start = perf_counter()
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=APPLE_PW_COMMIT_TIMEOUT_MS)
+        timings["goto_ms"] = int((perf_counter() - goto_start) * 1000)
         status = resp.status if resp else None
         final_url = resp.url if resp else url
         meta_local.update({"apple_http_status": status, "apple_final_url": final_url})
 
+        # **Early exit if page returned 404 or other error status**
+        if status and status >= 400:
+            logger.warning(f"[Apple Network] HTTP {status} error received; aborting")
+            error_meta = {
+                **meta_local,
+                "reason": f"http_{status}",
+                "apple_api_candidates": [],
+                "apple_response_candidates": [],
+                "apple_request_candidates": [],
+                "apple_legacy_used": False,
+            }
+            error_meta["timings"] = dict(timings)
+            error_meta = _apply_debug_filter(error_meta) or {}
+            await _save_apple_failure_artifacts(
+                page,
+                "fast",
+                final_url or url,
+                f"http_{status}",
+                error_meta,
+            )
+            raise AppleFetchError(
+                f"Apple page returned HTTP {status}",
+                meta=error_meta,
+            )
+
+        # Country selection gate (Continue / 続ける button) - click and wait for tracks
+        try:
+            for sel in ["button:has-text('Continue')", "button:has-text('続ける')"]:
+                try:
+                    locator = page.locator(sel).first
+                    await locator.wait_for(timeout=2000)
+                    await locator.click()
+                    await page.wait_for_timeout(500)
+                    logger.info("[Apple Network] Clicked country gate button")
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Wait for track list DOM (data-testid="track-list-item" or role="row") with reasonable timeout
+        wait_tracks_start = perf_counter()
+        try:
+            track_selector = '[data-testid="track-list-item"], div[role="row"]'
+            await page.wait_for_selector(track_selector, timeout=APPLE_DOM_WAIT_MS)
+            timings["wait_tracks_ms"] = int((perf_counter() - wait_tracks_start) * 1000)
+            logger.info("[Apple Network] Track list items appeared in DOM")
+        except Exception:
+            timings["wait_tracks_ms"] = int((perf_counter() - wait_tracks_start) * 1000)
+            logger.debug("[Apple Network] No track list items found after waiting")
+
+        # --- Timing: scroll_ms ---
+        scroll_start = perf_counter()
+
+        # Progressive scroll to load more rows (virtualized lists) with content-change detection
+        scroll_start = perf_counter()
+        row_counts: list[int] = []
+        last_track_keys: list[str | None] = []
+        unique_track_counts: list[int] = []
+        last_row_texts: list[str | None] = []
+        unique_keys: set[str] = set()
+        prev_count = 0
+        prev_last_key: str | None = None
+        prev_unique = 0
+        stable_rounds = 0
+        stable_target = max(1, APPLE_DOM_SCROLL_STABLE_ROUNDS)
+        max_iters = max(1, APPLE_DOM_SCROLL_MAX_ITERS)
+
+        tracklist_locator = None
+        container_selectors = [
+            "[data-testid='track-list']",
+            "div[role='grid']",
+            "main [role='grid']",
+            "main [data-testid='track-list']",
+        ]
+        for sel in container_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    tracklist_locator = loc
+                    _set_debug_meta(meta_local, "apple_tracklist_selector", sel)
+                    break
+            except Exception:
+                continue
+
+        async def _scroll_tracklist() -> bool:
+            if tracklist_locator:
+                try:
+                    await tracklist_locator.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                    return True
+                except Exception:
+                    pass
+            try:
+                await page.mouse.wheel(0, 1800)
+                return True
+            except Exception:
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    return True
+                except Exception:
+                    return False
+
+        for i in range(max_iters):
+            try:
+                html_snapshot = await page.content()
+            except Exception:
+                html_snapshot = None
+
+            count = 0
+            track_key = None
+            last_row_text = None
+
+            if html_snapshot:
+                count = html_snapshot.count('data-testid="track-list-item"') + html_snapshot.count('role="row"')
+                try:
+                    soup = BeautifulSoup(html_snapshot, "html.parser")
+                    rows = soup.find_all(attrs={"data-testid": "track-list-item"})
+                    if not rows:
+                        rows = soup.find_all("div", attrs={"role": "row"})
+                    if rows:
+                        last_row = rows[-1]
+                        last_row_text = last_row.get_text(" ", strip=True)[:160]
+                        aria_label = last_row.get("aria-label", "")
+                        if aria_label:
+                            parts = [p.strip() for p in aria_label.split("、") if p.strip()] or [p.strip() for p in aria_label.split(",") if p.strip()]
+                            if parts:
+                                title = parts[0]
+                                artist = parts[1] if len(parts) > 1 else ""
+                                track_key = f"{title}|||{artist}"
+                        if track_key is None:
+                            links = last_row.find_all("a", limit=2)
+                            if links:
+                                title = links[0].get_text(strip=True) if len(links) > 0 else ""
+                                artist = links[1].get_text(strip=True) if len(links) > 1 else ""
+                                if title:
+                                    track_key = f"{title}|||{artist}"
+                        if track_key is None and last_row_text:
+                            words = last_row_text.split()
+                            if words:
+                                track_key = f"{words[0]}|||"
+                except Exception:
+                    pass
+
+            row_counts.append(count)
+            if track_key:
+                unique_keys.add(track_key)
+            unique_count = len(unique_keys)
+            last_track_keys.append(track_key)
+            unique_track_counts.append(unique_count)
+            last_row_texts.append(last_row_text)
+
+            if (count > prev_count) or (track_key and track_key != prev_last_key) or (unique_count > prev_unique):
+                stable_rounds = 0
+            else:
+                stable_rounds += 1
+
+            prev_count = max(prev_count, count)
+            if track_key:
+                prev_last_key = track_key
+            prev_unique = max(prev_unique, unique_count)
+
+            if stable_rounds >= stable_target:
+                break
+
+            await _scroll_tracklist()
+            await page.wait_for_timeout(APPLE_DOM_SCROLL_PAUSE_MS)
+
+        try:
+            _set_debug_meta(meta_local, "apple_row_count_progression", row_counts[:20])
+            _set_debug_meta(meta_local, "apple_last_track_key_progression", last_track_keys[:20])
+            _set_debug_meta(meta_local, "apple_unique_track_keys_progression", unique_track_counts[:20])
+            _set_debug_meta(meta_local, "apple_last_row_text_progression", last_row_texts[:20])
+            _set_debug_meta(meta_local, "apple_row_count_final", row_counts[-1] if row_counts else None)
+            _set_debug_meta(meta_local, "apple_row_count_iters", len(row_counts))
+        except Exception:
+            pass
+        if row_counts:
+            logger.info(f"[Apple DOM] row_count progression: {row_counts} (final={row_counts[-1]})")
+        timings["scroll_ms"] = int((perf_counter() - scroll_start) * 1000)
+
         # Capture page title and snippet early for diagnostics
         try:
-            meta_local["apple_page_title"] = await page.title()
+            _set_debug_meta(meta_local, "apple_page_title", await page.title())
         except Exception:
-            meta_local["apple_page_title"] = None
+            pass
         try:
             snap_html = await page.content()
-            meta_local["apple_html_snippet"] = (snap_html or "")[:2048]
+            _set_debug_meta(meta_local, "apple_html_snippet", (snap_html or "")[:2048])
         except Exception:
-            meta_local["apple_html_snippet"] = None
+            pass
 
-        # Quick consent/banner handling to unblock API firing
+        # Quick consent/banner handling to unblock any remaining gates
         try:
             consent_selectors = [
                 "button:has-text('Accept')",
@@ -931,85 +1245,110 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
         except Exception:
             pass
 
-        # Light user interaction to trigger lazy loading
+        # Light user interaction to trigger lazy loading (short wait since we're prioritizing DOM)
         try:
-            for _ in range(2):
-                await page.wait_for_timeout(500)
+            for _ in range(1):
+                await page.wait_for_timeout(300)
                 try:
-                    await page.mouse.wheel(0, 1200)
+                    await page.mouse.wheel(0, 800)
                 except Exception:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
-                await page.wait_for_timeout(500)
-            try:
-                await page.evaluate("window.scrollTo(0, 1000)")
-                await page.wait_for_timeout(200)
-                await page.evaluate("window.scrollTo(0, 0)")
-            except Exception:
-                pass
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.3)")
+                await page.wait_for_timeout(300)
         except Exception:
             pass
 
-        # Wait for API response capture (15s timeout)
-        api_wait_timeout = APPLE_PW_NET_WAIT_MS
-        api_wait_start = time.time()
-        while api_response_captured is None:
-            if (time.time() - api_wait_start) * 1000 > api_wait_timeout:
-                logger.info("[Apple Network] No API response captured within timeout")
-                break
-            await asyncio.sleep(0.2)
+        # **PRIORITY 1: Try DOM extraction first (data-testid="track-list-item" or role="row")**
 
-        # Try to extract tracks from API response
-        if api_response_captured:
+        # --- 明示的なAPI優先・DOM fallback分岐 ---
+        extract_method = None
+        # --- Timing: content_ms ---
+        content_start = perf_counter()
+        html_dom = await page.content()
+        timings["content_ms"] = int((perf_counter() - content_start) * 1000)
+        extract_start = perf_counter()
+        dom_parse_start = perf_counter()
+        dom_result = None
+        if html_dom:
             try:
-                body = api_response_captured["body"]
+                dom_result = _parse_apple_html_dom_rows(
+                    html_dom,
+                    final_url or url,
+                    meta_extra={**meta_local, "apple_extraction_method": "dom_rows"},
+                )
+            except Exception as e:
+                logger.debug(f"[Apple Network] DOM extraction failed: {e}")
+        timings["dom_parse_ms"] = int((perf_counter() - dom_parse_start) * 1000)
+        timings["extract_ms"] = int((perf_counter() - extract_start) * 1000)
+
+        # --- Timing: post_start ---
+        post_start = perf_counter()
+
+        # Patch A: If DOM result is good, skip API wait and return immediately
+        if dom_result and (dom_result.get("items") or dom_result.get("tracks")) and len(dom_result.get("items") or dom_result.get("tracks") or []) >= 5:
+            overall_end = perf_counter()
+            if post_start is not None:
+                timings["post_ms"] = int((overall_end - post_start) * 1000)
+            meta_local["apple_extraction_method"] = "dom_rows"
+            meta_local["timings"] = dict(_finalize_timings(timings, overall_start, post_start))
+            if isinstance(dom_result, dict):
+                dom_result.setdefault("meta", {})
+                if isinstance(dom_result["meta"], dict):
+                    dom_result["meta"].update(meta_local)
+            return dom_result
+
+        # Always include timings in meta (UI/analysis uses this)
+        overall_end = perf_counter()
+        if post_start is not None:
+            timings["post_ms"] = int((overall_end - post_start) * 1000)
+        meta_local["timings"] = dict(timings)
+        # Optional: keep debug-only detailed key too
+        _set_debug_meta(meta_local, "apple_timing", timings)
+
+        # API優先: 一定時間待つ（来なければDOM結果へ）
+        api_wait_timeout = min(8000, APPLE_PW_NET_WAIT_MS)
+        api_wait_start = perf_counter()
+        while api_response_captured is None and (perf_counter() - api_wait_start) * 1000 < api_wait_timeout:
+            await asyncio.sleep(0.2)
+        timings["api_wait_ms"] = int((perf_counter() - api_wait_start) * 1000)
+
+        api_result = None
+        if api_response_captured is not None:
+            try:
+                body = api_response_captured.get("body")
                 tracks, playlist_name = _extract_tracks_from_json_tree(body)
                 if tracks:
-                    result = _build_apple_playlist_result(
+                    api_result = _build_apple_playlist_result(
                         tracks,
                         playlist_name or "Apple Music Playlist",
                         final_url or url,
-                        meta_extra={
-                            **meta_local,
-                            "apple_playwright_phase": "network_json",
-                            "apple_api_url": api_response_captured["url"],
-                            "apple_legacy_used": False,
-                        },
+                        meta_extra={**meta_local, "apple_extraction_method": "catalog_api"},
                     )
-                    logger.info(f"[Apple Network] Extracted {len(tracks)} tracks from API response")
+                    meta_local["seen_catalog_playlist_api"] = True
             except Exception as e:
-                logger.debug(f"[Apple Network] Failed to parse API response: {e}")
+                logger.debug(f"[Apple Network] Catalog API parse failed; fallback to DOM. err={e}")
+                api_result = None
 
-        # DOM fallback if API response unavailable
-        if result is None:
-            try:
-                try:
-                    await page.wait_for_selector(
-                        'div[role="row"], ol li, .songs-list-row, apple-music-item, .music-item, [data-test-song-row]',
-                        timeout=8000,
-                    )
-                except Exception:
-                    pass
-                await page.wait_for_timeout(500)
-                try:
-                    await page.wait_for_selector(
-                        'script[id="__NEXT_DATA__"], script[type="application/json"], script[type="application/ld+json"]',
-                        timeout=APPLE_PW_DOM_TIMEOUT_MS,
-                    )
-                except Exception:
-                    pass
-                html_dom = await page.content()
-            except Exception:
-                html_dom = None
+        # 最終結果の確定（API > DOM）
+        if api_result:
+            result = api_result
+            meta_local["apple_extraction_method"] = "catalog_api"
+        elif dom_result:
+            result = dom_result
+            meta_local["apple_extraction_method"] = "dom_rows"
+        else:
+            meta_local["apple_extraction_method"] = "none"
+            meta_local["timings"] = dict(_finalize_timings(timings, overall_start, post_start))
+            raise AppleFetchError("Apple extraction failed (no API result and no DOM result)", meta=meta_local)
 
-            if html_dom:
-                parsed_dom = _parse_apple_html_payload(
-                    html_dom,
-                    final_url or url,
-                    strategy_hint="playwright",
-                    meta_extra={**meta_local, "apple_playwright_phase": "dom_fallback", "apple_legacy_used": False},
-                )
-                if parsed_dom and parsed_dom.get("items"):
-                    result = parsed_dom
+        # --- Patch: always merge meta_local into result['meta'] after result is set ---
+        overall_end = perf_counter()
+        if post_start is not None:
+            timings["post_ms"] = int((overall_end - post_start) * 1000)
+        meta_local["timings"] = dict(_finalize_timings(timings, overall_start, post_start))
+        if isinstance(result, dict):
+            result.setdefault("meta", {})
+            if isinstance(result["meta"], dict):
+                result["meta"].update(meta_local)
 
         # Detect blocked/JS-required variant with enhanced detection
         if result is None:
@@ -1044,17 +1383,40 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
                 meta_reason = "blocked_variant"
             elif reason == "no_tracks":
                 if not seen_catalog_playlist_api:
-                    meta_reason = "catalog_api_not_fired"
+                    meta_reason = "no_dom_rows_no_api"
                 elif response_candidates or json_responses_any_domain or xhr_fetch_requests:
-                    meta_reason = "catalog_api_unparsed"
+                    meta_reason = "api_not_parseable"
                 else:
-                    meta_reason = "no_apple_traffic"
+                    meta_reason = "no_apple_api_detected"
 
-            raise AppleFetchError(
-                f"Apple page load failed (Playwright, {meta_reason})",
-                meta={
-                    **meta_local,
-                    "reason": meta_reason,
+            # Save failure artifacts for diagnostics
+            found_track_rows = False
+            row_count = 0
+            try:
+                if page_html:
+                    row_count = page_html.count('data-testid="track-list-item"') + page_html.count('role="row"')
+                    found_track_rows = row_count > 0
+            except Exception:
+                pass
+
+            # Finalize timing for error
+            overall_end = perf_counter()
+            timings["overall_ms"] = int((overall_end - overall_start) * 1000)
+            if post_start is not None:
+                timings["post_ms"] = int((overall_end - post_start) * 1000)
+            _set_debug_meta(meta_local, "apple_timing", timings)
+
+            error_meta = {
+                **meta_local,
+                "reason": meta_reason,
+                "found_track_rows": found_track_rows,
+                "row_count": row_count,
+                "seen_catalog_playlist_api": seen_catalog_playlist_api,
+                "apple_legacy_used": False,
+            }
+            error_meta["timings"] = dict(timings)
+            if APPLE_DEBUG:
+                error_meta.update({
                     "apple_api_candidates": api_candidates[:20],
                     "apple_response_candidates": response_candidates[:20],
                     "apple_request_candidates": request_candidates[:20],
@@ -1062,44 +1424,116 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
                     "json_responses_any_domain": json_responses_any_domain[:20],
                     "apple_console_errors": console_errors[:20],
                     "apple_page_errors": page_errors[:20],
-                    "seen_catalog_playlist_api": seen_catalog_playlist_api,
-                    "apple_legacy_used": False,
-                },
+                    "apple_timing": meta_local.get("apple_timing"),
+                })
+            error_meta = _apply_debug_filter(error_meta) or {}
+
+            await _save_apple_failure_artifacts(
+                page,
+                "fast",
+                meta_local.get("apple_final_url") or url,
+                meta_reason,
+                error_meta,
+            )
+            raise AppleFetchError(
+                f"Apple page load failed (Playwright, {meta_reason})",
+                meta=error_meta,
             )
 
         # cache and record timestamp
         if result is not None:
+            overall_end = perf_counter()
+            if post_start is not None:
+                timings["post_ms"] = int((overall_end - post_start) * 1000)
+            timings["overall_ms"] = int((perf_counter() - overall_start) * 1000)
+            known = sum(
+                v for k, v in timings.items() if k in ("setup_ms", "goto_ms", "wait_ms", "scroll_ms", "extract_ms", "post_ms") and isinstance(v, (int, float))
+            )
+            timings["other_ms"] = max(0, timings["overall_ms"] - known)
+            _set_debug_meta(meta_local, "apple_timing", timings)
+
+
             try:
                 result.setdefault("meta", {})
-                result["meta"].setdefault("apple_api_candidates", api_candidates[:20])
-                if response_candidates:
-                    result["meta"].setdefault("apple_response_candidates", response_candidates[:20])
-                if request_candidates:
-                    result["meta"].setdefault("apple_request_candidates", request_candidates[:20])
-                if xhr_fetch_requests:
-                    result["meta"].setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
-                if json_responses_any_domain:
-                    result["meta"].setdefault("json_responses_any_domain", json_responses_any_domain[:20])
-                if console_errors:
-                    result["meta"].setdefault("apple_console_errors", console_errors[:20])
-                if page_errors:
-                    result["meta"].setdefault("apple_page_errors", page_errors[:20])
-                result["meta"].setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
-                result["meta"].setdefault("apple_page_title", meta_local.get("apple_page_title"))
-                result["meta"].setdefault("apple_html_snippet", meta_local.get("apple_html_snippet"))
-                result["meta"].setdefault("apple_legacy_used", False)
+                meta_out = result["meta"]
+                # ✅ always keep timings for UI/analysis
+                meta_out["timings"] = dict(timings)
+                if APPLE_DEBUG:
+                    meta_out.setdefault("apple_api_candidates", api_candidates[:20])
+                    if response_candidates:
+                        meta_out.setdefault("apple_response_candidates", response_candidates[:20])
+                    if request_candidates:
+                        meta_out.setdefault("apple_request_candidates", request_candidates[:20])
+                    if xhr_fetch_requests:
+                        meta_out.setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
+                    if json_responses_any_domain:
+                        meta_out.setdefault("json_responses_any_domain", json_responses_any_domain[:20])
+                    if console_errors:
+                        meta_out.setdefault("apple_console_errors", console_errors[:20])
+                    if page_errors:
+                        meta_out.setdefault("apple_page_errors", page_errors[:20])
+                    meta_out.setdefault("apple_page_title", meta_local.get("apple_page_title"))
+                    meta_out.setdefault("apple_html_snippet", meta_local.get("apple_html_snippet"))
+                    meta_out.setdefault(
+                        "apple_row_count_progression",
+                        meta_local.get("apple_row_count_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_row_count_final",
+                        meta_local.get("apple_row_count_final"),
+                    )
+                    meta_out.setdefault(
+                        "apple_row_count_iters",
+                        meta_local.get("apple_row_count_iters"),
+                    )
+                    meta_out.setdefault(
+                        "apple_last_track_key_progression",
+                        meta_local.get("apple_last_track_key_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_unique_track_keys_progression",
+                        meta_local.get("apple_unique_track_keys_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_last_row_text_progression",
+                        meta_local.get("apple_last_row_text_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_tracklist_selector",
+                        meta_local.get("apple_tracklist_selector"),
+                    )
+                    meta_out.setdefault("apple_timing", {k: int(v) for k, v in timings.items()})
+                meta_out.setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
+                meta_out.setdefault("apple_legacy_used", False)
+                meta_out.setdefault("apple_extraction_method", meta_local.get("apple_extraction_method", "unknown"))
+                result["meta"] = _apply_debug_filter(meta_out) or {}
             except Exception:
                 pass
 
             cache[url] = result
             last[url] = time.time()
             logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright (fast)")
+            # --- Ensure timings is always present and int ---
+            for k, v in list(timings.items()):
+                try:
+                    timings[k] = int(v)
+                except Exception:
+                    timings[k] = 0
+            meta_local["timings"] = dict(timings)
+            if "meta" in result and isinstance(result["meta"], dict):
+                result["meta"].update(meta_local)
+            else:
+                result["meta"] = dict(meta_local)
             return result
     
     async def run_legacy_playwright() -> Dict[str, Any] | None:
-        """Legacy Playwright path with no blocking and longer waits."""
+        """Legacy Playwright path with longer waits and DOM-first strategy."""
         nonlocal context, page, result, meta_base, api_response_captured, api_candidates, response_candidates, xhr_fetch_requests, json_responses_any_domain, request_candidates, console_errors, page_errors, seen_catalog_playlist_api
+
+
         result = None
+        post_start = None  # Will be set to float before use
+        meta_local = {}
 
         api_response_captured = None
         api_candidates = []
@@ -1111,38 +1545,243 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
         page_errors = []
         seen_catalog_playlist_api = False
 
-        context = await new_context()
-        page = await context.new_page()
-        # Legacy: no blocking, longer timeouts
-        legacy_nav_timeout_ms = max(90000, APPLE_PW_COMMIT_TIMEOUT_MS)
-        legacy_dom_timeout_ms = max(30000, APPLE_PW_DOM_TIMEOUT_MS)
-        legacy_net_wait_ms = max(90000, APPLE_PW_NET_WAIT_MS)
+        # Use the already-initialized overall_start and timings
+        try:
+            context = await new_context()
+        except Exception as e:
+            err_msg = f"Playwright context creation failed (Chromium not available or browser init error): {str(e)}"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "context_creation_failed", "apple_legacy_used": True})
+        if context is None:
+            err_msg = "Playwright new_context() returned None"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "context_is_none", "apple_legacy_used": True})
+
+        try:
+            page = await context.new_page()
+        except Exception as e:
+            err_msg = f"Playwright page creation failed: {str(e)}"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            await context.close()
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "page_creation_failed", "apple_legacy_used": True})
+        if page is None:
+            await context.close()
+            err_msg = "Playwright page creation returned None"
+            logger.error(f"[Apple Playwright] {err_msg}")
+            raise AppleFetchError(err_msg, meta={**meta_base, "reason": "page_is_none", "apple_legacy_used": True})
+        # Legacy: longer timeouts
+        legacy_nav_timeout_ms = max(40000, APPLE_PW_COMMIT_TIMEOUT_MS)
+        legacy_dom_timeout_ms = max(15000, APPLE_PW_DOM_TIMEOUT_MS)
+        legacy_net_wait_ms = max(20000, APPLE_PW_NET_WAIT_MS)
         page.set_default_navigation_timeout(legacy_nav_timeout_ms)
         page.set_default_timeout(legacy_nav_timeout_ms)
 
-        # Listen for API responses and requests
+        # setup ends right before the single navigation
+
+        # **IMPORTANT: Register network listeners BEFORE page.goto() to capture API responses**
         page.on("response", on_response_handler)
         page.on("request", on_request_handler)
         page.on("console", lambda msg: console_errors.append(f"{msg.type}: {msg.text}") if len(console_errors) < 20 else None)
         page.on("pageerror", lambda err: page_errors.append(str(err)) if len(page_errors) < 20 else None)
 
-        meta_local = {**meta_base, "apple_playwright_phase": "legacy_networkidle", "apple_legacy_used": True}
+        meta_local = {**meta_base, "apple_playwright_phase": "legacy_dom_first", "apple_legacy_used": True}
 
-        # Networkidle navigation
-        resp = await page.goto(url, wait_until="networkidle", timeout=legacy_nav_timeout_ms)
+        # Use domcontentloaded to avoid waiting forever for all network requests
+        # Patch B: setup_ms calculation (before goto)
+        setup_end = perf_counter()
+        timings["setup_ms"] = int((setup_end - overall_start) * 1000)
+        goto_start = perf_counter()
+        timings["pre_goto_ms"] = int((goto_start - overall_start) * 1000)
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=legacy_nav_timeout_ms)
+        timings["goto_ms"] = int((perf_counter() - goto_start) * 1000)
         status = resp.status if resp else None
         final_url = resp.url if resp else url
         meta_local.update({"apple_http_status": status, "apple_final_url": final_url})
 
+        # **Early exit if page returned 404 or other error status**
+        if status and status >= 400:
+            logger.warning(f"[Apple Network] HTTP {status} error received (legacy); aborting")
+            error_meta = {
+                **meta_local,
+                "reason": f"http_{status}",
+                "apple_api_candidates": [],
+                "apple_response_candidates": [],
+                "apple_request_candidates": [],
+                "apple_legacy_used": True,
+            }
+            error_meta = _apply_debug_filter(error_meta) or {}
+            await _save_apple_failure_artifacts(
+                page,
+                "legacy",
+                final_url or url,
+                f"http_{status}",
+                error_meta,
+            )
+            raise AppleFetchError(
+                f"Apple page returned HTTP {status}",
+                meta=error_meta,
+            )
+
+        # Country selection gate (Continue / 続ける button)
         try:
-            meta_local["apple_page_title"] = await page.title()
+            for sel in ["button:has-text('Continue')", "button:has-text('続ける')"]:
+                try:
+                    locator = page.locator(sel).first
+                    await locator.wait_for(timeout=2000)
+                    await locator.click()
+                    await page.wait_for_timeout(500)
+                    logger.info("[Apple Network] Clicked country gate button (legacy)")
+                    break
+                except Exception:
+                    continue
         except Exception:
-            meta_local["apple_page_title"] = None
+            pass
+
+        # Wait for track list DOM
+        wait_start = perf_counter()
+        try:
+            track_selector = '[data-testid="track-list-item"], div[role="row"]'
+            await page.wait_for_selector(track_selector, timeout=APPLE_DOM_WAIT_MS)
+            timings["wait_ms"] = int((perf_counter() - wait_start) * 1000)
+            logger.info("[Apple Network] Track list items appeared in DOM (legacy)")
+        except Exception:
+            timings["wait_ms"] = int((perf_counter() - wait_start) * 1000)
+            logger.debug("[Apple Network] No track list items found after waiting (legacy)")
+
+        scroll_start = perf_counter()
+        # Progressive scroll to load more rows (virtualized lists) with content-change detection
+        row_counts: list[int] = []
+        last_track_keys: list[str | None] = []
+        unique_track_counts: list[int] = []
+        last_row_texts: list[str | None] = []
+        unique_keys: set[str] = set()
+        prev_count = 0
+        prev_last_key: str | None = None
+        prev_unique = 0
+        stable_rounds = 0
+        stable_target = max(1, APPLE_DOM_SCROLL_STABLE_ROUNDS)
+        max_iters = max(1, APPLE_DOM_SCROLL_MAX_ITERS)
+
+        tracklist_locator = None
+        container_selectors = [
+            "[data-testid='track-list']",
+            "div[role='grid']",
+            "main [role='grid']",
+            "main [data-testid='track-list']",
+        ]
+        for sel in container_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    tracklist_locator = loc
+                    _set_debug_meta(meta_local, "apple_tracklist_selector", sel)
+                    break
+            except Exception:
+                continue
+
+        async def _scroll_tracklist() -> bool:
+            if tracklist_locator:
+                try:
+                    await tracklist_locator.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+                    return True
+                except Exception:
+                    pass
+            try:
+                await page.mouse.wheel(0, 1800)
+                return True
+            except Exception:
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    return True
+                except Exception:
+                    return False
+
+        for i in range(max_iters):
+            try:
+                html_snapshot = await page.content()
+            except Exception:
+                html_snapshot = None
+
+            count = 0
+            track_key = None
+            last_row_text = None
+
+            if html_snapshot:
+                count = html_snapshot.count('data-testid="track-list-item"') + html_snapshot.count('role="row"')
+                try:
+                    soup = BeautifulSoup(html_snapshot, "html.parser")
+                    rows = soup.find_all(attrs={"data-testid": "track-list-item"})
+                    if not rows:
+                        rows = soup.find_all("div", attrs={"role": "row"})
+                    try:
+                        extract_start = perf_counter()
+                        html_dom = await page.content()
+                        if html_dom:
+                            dom_result = _parse_apple_html_dom_rows(
+                                html_dom,
+                                final_url or url,
+                                meta_extra={**meta_local, "apple_extraction_method": "dom_rows"},
+                            )
+                            if dom_result and dom_result.get("items"):
+                                tracks_found_in_dom = True
+                                result = dom_result
+                                logger.info(f"[Apple Network] Extracted {len(result.get('items', []))} tracks from DOM rows (legacy)")
+                        timings["extract_ms"] = int((perf_counter() - extract_start) * 1000)
+                    except Exception as e:
+                        timings["extract_ms"] = int((perf_counter() - extract_start) * 1000)
+                        logger.debug(f"[Apple Network] DOM extraction failed (legacy): {e}")
+
+                    # post_start must be set immediately after DOM extraction, before any further Python-side processing
+                    post_start = perf_counter()
+                except Exception:
+                    pass
+
+            row_counts.append(count)
+            if track_key:
+                unique_keys.add(track_key)
+            unique_count = len(unique_keys)
+            last_track_keys.append(track_key)
+            unique_track_counts.append(unique_count)
+            last_row_texts.append(last_row_text)
+
+            if (count > prev_count) or (track_key and track_key != prev_last_key) or (unique_count > prev_unique):
+                stable_rounds = 0
+            else:
+                stable_rounds += 1
+
+            prev_count = max(prev_count, count)
+            if track_key:
+                prev_last_key = track_key
+            prev_unique = max(prev_unique, unique_count)
+
+            if stable_rounds >= stable_target:
+                break
+
+            await _scroll_tracklist()
+            await page.wait_for_timeout(APPLE_DOM_SCROLL_PAUSE_MS)
+
+        try:
+            _set_debug_meta(meta_local, "apple_row_count_progression", row_counts[:20])
+            _set_debug_meta(meta_local, "apple_last_track_key_progression", last_track_keys[:20])
+            _set_debug_meta(meta_local, "apple_unique_track_keys_progression", unique_track_counts[:20])
+            _set_debug_meta(meta_local, "apple_last_row_text_progression", last_row_texts[:20])
+            _set_debug_meta(meta_local, "apple_row_count_final", row_counts[-1] if row_counts else None)
+            _set_debug_meta(meta_local, "apple_row_count_iters", len(row_counts))
+        except Exception:
+            pass
+        if row_counts:
+            logger.info(f"[Apple DOM] row_count progression (legacy): {row_counts} (final={row_counts[-1]})")
+        timings["scroll_ms"] = int((perf_counter() - scroll_start) * 1000)
+
+        try:
+            _set_debug_meta(meta_local, "apple_page_title", await page.title())
+        except Exception:
+            pass
         try:
             snap_html = await page.content()
-            meta_local["apple_html_snippet"] = (snap_html or "")[:2048]
+            _set_debug_meta(meta_local, "apple_html_snippet", (snap_html or "")[:2048])
         except Exception:
-            meta_local["apple_html_snippet"] = None
+            pass
 
         # Consent / upsell handling
         try:
@@ -1181,97 +1820,145 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
         except Exception:
             pass
 
-        # Extended wait for track rows and scripts
+        # Scroll to trigger lazy loading
         try:
-            await page.wait_for_selector(
-                'div[role="row"], ol li, .songs-list-row, apple-music-item, .music-item, [data-test-song-row]',
-                timeout=legacy_dom_timeout_ms,
-            )
-        except Exception:
-            pass
-        try:
-            await page.wait_for_selector(
-                'script[id="__NEXT_DATA__"], script[type="application/json"], script[type="application/ld+json"]',
-                timeout=legacy_dom_timeout_ms,
-            )
-        except Exception:
-            pass
-
-        # Slow scroll nudges to trigger lazy loading
-        try:
-            for _ in range(3):
-                await page.wait_for_timeout(800)
+            for _ in range(2):
+                await page.wait_for_timeout(600)
                 try:
-                    await page.mouse.wheel(0, 1600)
+                    await page.mouse.wheel(0, 1200)
                 except Exception:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
-                await page.wait_for_timeout(800)
-            try:
-                await page.evaluate("window.scrollTo(0, 2000)")
-                await page.wait_for_timeout(500)
-                await page.evaluate("window.scrollTo(0, 0)")
-            except Exception:
-                pass
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
+                await page.wait_for_timeout(600)
         except Exception:
             pass
 
-        # Wait longer for API if it fires late
-        api_wait_start = time.time()
-        while api_response_captured is None:
-            if (time.time() - api_wait_start) * 1000 > legacy_net_wait_ms:
-                break
-            await asyncio.sleep(0.3)
+        # **PRIORITY 1: Try DOM extraction first**
+        tracks_found_in_dom = False
+        dom_result = None
+        try:
+            extract_start = perf_counter()
+            html_dom = await page.content()
+            if html_dom:
+                dom_result = _parse_apple_html_dom_rows(
+                    html_dom,
+                    final_url or url,
+                    meta_extra={**meta_local, "apple_extraction_method": "dom_rows"},
+                )
+                if dom_result and dom_result.get("items"):
+                    tracks_found_in_dom = True
+                    result = dom_result
+                    logger.info(f"[Apple Network] Extracted {len(result.get('items', []))} tracks from DOM rows (legacy)")
+            timings["extract_ms"] = int((perf_counter() - extract_start) * 1000)
+        except Exception as e:
+            timings["extract_ms"] = int((perf_counter() - extract_start) * 1000)
+            logger.debug(f"[Apple Network] DOM extraction failed (legacy): {e}")
 
-        # Parse API first if available
-        if api_response_captured:
-            try:
-                body = api_response_captured["body"]
-                tracks, playlist_name = _extract_tracks_from_json_tree(body)
-                if tracks:
-                    result = _build_apple_playlist_result(
-                        tracks,
-                        playlist_name or "Apple Music Playlist",
-                        final_url or url,
-                        meta_extra={
-                            **meta_local,
-                            "apple_playwright_phase": "legacy_networkidle",
-                            "apple_api_url": api_response_captured["url"],
-                        },
-                    )
-                    logger.info(f"[Apple Network] Extracted {len(tracks)} tracks from API response (legacy)")
-            except Exception as e:
-                logger.debug(f"[Apple Network] Failed to parse API response (legacy): {e}")
+        # Move post_start here: after DOM extraction, before any Python-side track assembly/normalization
+        post_start = perf_counter()
+        # (do not set post_ms here; set at overall_end)
+        # Patch A: If DOM result is good, skip API wait and return immediately
+        if tracks_found_in_dom and result and (result.get("items") or result.get("tracks")) and len(result.get("items") or result.get("tracks") or []) >= 5:
+            meta_local["apple_extraction_method"] = "dom_rows"
+            # Patch B: Ensure all timings are int
+            for k, v in list(timings.items()):
+                try:
+                    timings[k] = int(v)
+                except Exception:
+                    timings[k] = 0
+            # Patch C: Calculate other_ms as int residual
+            known = 0
+            for k in ["setup_ms","goto_ms","wait_ms","scroll_ms","extract_ms","post_ms"]:
+                known += int(timings.get(k, 0) or 0)
+            timings["other_ms"] = max(0, int(timings.get("overall_ms", 0)) - known)
+            meta_local["timings"] = dict(timings)
+            return result
 
-        # DOM parse
+        # **PRIORITY 2: Wait for API response if DOM not found**
+        if not tracks_found_in_dom:
+            api_wait_start = perf_counter()
+            while api_response_captured is None:
+                if (perf_counter() - api_wait_start) * 1000 > legacy_net_wait_ms:
+                    logger.debug("[Apple Network] No API response captured within timeout (legacy)")
+                    break
+                await asyncio.sleep(0.3)
+
+            # Parse API first if available
+            if api_response_captured:
+                try:
+                    body = api_response_captured["body"]
+                    tracks, playlist_name = _extract_tracks_from_json_tree(body)
+                    if tracks:
+                        result = _build_apple_playlist_result(
+                            tracks,
+                            playlist_name or "Apple Music Playlist",
+                            final_url or url,
+                            meta_extra={
+                                **meta_local,
+                                "apple_extraction_method": "api_json",
+                                "apple_api_url": api_response_captured["url"],
+                            },
+                        )
+                        logger.info(f"[Apple Network] Extracted {len(tracks)} tracks from API response (legacy)")
+                except Exception as e:
+                    logger.debug(f"[Apple Network] Failed to parse API response (legacy): {e}")
+
+        # **PRIORITY 3: Fallback to JSON parsing**
         if result is None:
             try:
                 html_dom = await page.content()
-            except Exception:
-                html_dom = None
-            if html_dom:
-                parsed_dom = _parse_apple_html_payload(
-                    html_dom,
-                    final_url or url,
-                    strategy_hint="playwright-legacy",
-                    meta_extra={**meta_local, "apple_playwright_phase": "legacy_dom", "apple_legacy_used": True},
-                )
-                if parsed_dom and parsed_dom.get("items"):
-                    result = parsed_dom
+                if html_dom:
+                    parsed_dom = _parse_apple_html_payload(
+                        html_dom,
+                        final_url or url,
+                        strategy_hint="playwright-legacy",
+                        meta_extra={**meta_local, "apple_extraction_method": "json_fallback"},
+                    )
+                    if parsed_dom and parsed_dom.get("items"):
+                        result = parsed_dom
+                        logger.info(f"[Apple Network] Extracted {len(result.get('items', []))} tracks from JSON fallback (legacy)")
+            except Exception as e:
+                logger.debug(f"[Apple Network] JSON fallback failed (legacy): {e}")
 
         # Failure -> raise with meta
         if result is None:
             reason = "no_tracks"
+            
+            # Count DOM rows for diagnostics
+            found_track_rows = False
+            row_count = 0
+            try:
+                if html_dom:
+                    row_count = html_dom.count('data-testid="track-list-item"') + html_dom.count('role="row"')
+                    found_track_rows = row_count > 0
+            except Exception:
+                pass
+            
             if not seen_catalog_playlist_api:
-                reason = "catalog_api_not_fired"
+                reason = "no_dom_rows_no_api"
             elif response_candidates or json_responses_any_domain or xhr_fetch_requests:
-                reason = "catalog_api_unparsed"
+                reason = "api_not_parseable"
             else:
-                reason = "no_apple_traffic"
-            raise AppleFetchError(
-                "Apple page load failed (legacy)",
-                meta={
-                    **meta_local,
-                    "reason": reason,
+                reason = "no_apple_api_detected"
+            
+            # Finalize timing for error
+
+            overall_end = perf_counter()
+            timings["overall_ms"] = int((overall_end - overall_start) * 1000)
+            if post_start is not None:
+                timings["post_ms"] = int((overall_end - post_start) * 1000)
+            _set_debug_meta(meta_local, "apple_timing", timings)
+
+            error_meta = {
+                **meta_local,
+                "reason": reason,
+                "found_track_rows": found_track_rows,
+                "row_count": row_count,
+                "seen_catalog_playlist_api": seen_catalog_playlist_api,
+                "apple_legacy_used": True,
+            }
+            error_meta["timings"] = dict(timings)
+            if APPLE_DEBUG:
+                error_meta.update({
                     "apple_api_candidates": api_candidates[:20],
                     "apple_response_candidates": response_candidates[:20],
                     "apple_request_candidates": request_candidates[:20],
@@ -1279,37 +1966,105 @@ async def fetch_apple_playlist_tracks_from_web(url: str, app: Any | None = None,
                     "json_responses_any_domain": json_responses_any_domain[:20],
                     "apple_console_errors": console_errors[:20],
                     "apple_page_errors": page_errors[:20],
-                    "seen_catalog_playlist_api": seen_catalog_playlist_api,
-                    "apple_legacy_used": True,
-                },
+                    "apple_timing": meta_local.get("apple_timing"),
+                })
+            error_meta = _apply_debug_filter(error_meta) or {}
+
+            await _save_apple_failure_artifacts(
+                page,
+                "legacy",
+                meta_local.get("apple_final_url") or url,
+                reason,
+                error_meta,
+            )
+            raise AppleFetchError(
+                "Apple page load failed (legacy)",
+                meta=error_meta,
             )
 
         if result is not None:
+            overall_end = perf_counter()
+            if post_start is not None:
+                timings["post_ms"] = int((overall_end - post_start) * 1000)
+            timings["overall_ms"] = int((perf_counter() - overall_start) * 1000)
+            known = sum(
+                v for k, v in timings.items() if k in ("setup_ms", "goto_ms", "wait_ms", "scroll_ms", "extract_ms", "post_ms") and isinstance(v, (int, float))
+            )
+            timings["other_ms"] = max(0, timings["overall_ms"] - known)
+            _set_debug_meta(meta_local, "apple_timing", timings)
+
+
             try:
                 result.setdefault("meta", {})
-                result["meta"].setdefault("apple_api_candidates", api_candidates[:20])
-                if response_candidates:
-                    result["meta"].setdefault("apple_response_candidates", response_candidates[:20])
-                if request_candidates:
-                    result["meta"].setdefault("apple_request_candidates", request_candidates[:20])
-                if xhr_fetch_requests:
-                    result["meta"].setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
-                if json_responses_any_domain:
-                    result["meta"].setdefault("json_responses_any_domain", json_responses_any_domain[:20])
-                if console_errors:
-                    result["meta"].setdefault("apple_console_errors", console_errors[:20])
-                if page_errors:
-                    result["meta"].setdefault("apple_page_errors", page_errors[:20])
-                result["meta"].setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
-                result["meta"].setdefault("apple_page_title", meta_local.get("apple_page_title"))
-                result["meta"].setdefault("apple_html_snippet", meta_local.get("apple_html_snippet"))
-                result["meta"].setdefault("apple_legacy_used", True)
+                meta_out = result["meta"]
+                # ✅ always keep timings for UI/analysis
+                meta_out["timings"] = dict(timings)
+                if APPLE_DEBUG:
+                    meta_out.setdefault("apple_api_candidates", api_candidates[:20])
+                    if response_candidates:
+                        meta_out.setdefault("apple_response_candidates", response_candidates[:20])
+                    if request_candidates:
+                        meta_out.setdefault("apple_request_candidates", request_candidates[:20])
+                    if xhr_fetch_requests:
+                        meta_out.setdefault("apple_xhr_fetch_requests", xhr_fetch_requests[:10])
+                    if json_responses_any_domain:
+                        meta_out.setdefault("json_responses_any_domain", json_responses_any_domain[:20])
+                    if console_errors:
+                        meta_out.setdefault("apple_console_errors", console_errors[:20])
+                    if page_errors:
+                        meta_out.setdefault("apple_page_errors", page_errors[:20])
+                    meta_out.setdefault("apple_page_title", meta_local.get("apple_page_title"))
+                    meta_out.setdefault("apple_html_snippet", meta_local.get("apple_html_snippet"))
+                    meta_out.setdefault(
+                        "apple_row_count_progression",
+                        meta_local.get("apple_row_count_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_row_count_final",
+                        meta_local.get("apple_row_count_final"),
+                    )
+                    meta_out.setdefault(
+                        "apple_row_count_iters",
+                        meta_local.get("apple_row_count_iters"),
+                    )
+                    meta_out.setdefault(
+                        "apple_last_track_key_progression",
+                        meta_local.get("apple_last_track_key_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_unique_track_keys_progression",
+                        meta_local.get("apple_unique_track_keys_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_last_row_text_progression",
+                        meta_local.get("apple_last_row_text_progression"),
+                    )
+                    meta_out.setdefault(
+                        "apple_tracklist_selector",
+                        meta_local.get("apple_tracklist_selector"),
+                    )
+                    meta_out.setdefault("apple_timing", {k: int(v) for k, v in timings.items()})
+                meta_out.setdefault("seen_catalog_playlist_api", seen_catalog_playlist_api)
+                meta_out.setdefault("apple_legacy_used", True)
+                meta_out.setdefault("apple_extraction_method", meta_local.get("apple_extraction_method", "unknown"))
+                result["meta"] = _apply_debug_filter(meta_out) or {}
             except Exception:
                 pass
 
             cache[url] = result
             last[url] = time.time()
             logger.info(f"[Apple Music] Parsed {len(result.get('items', []))} tracks via Playwright (legacy)")
+            # --- Ensure timings is always present and int ---
+            for k, v in list(timings.items()):
+                try:
+                    timings[k] = int(v)
+                except Exception:
+                    timings[k] = 0
+            meta_local["timings"] = dict(timings)
+            if "meta" in result and isinstance(result["meta"], dict):
+                result["meta"].update(meta_local)
+            else:
+                result["meta"] = dict(meta_local)
             return result
     
     fast_error: AppleFetchError | None = None
@@ -1679,6 +2434,207 @@ def _build_apple_playlist_result(
     return {"playlist": playlist, "items": items, "meta": meta}
 
 
+def _parse_apple_html_dom_rows(html: str, url: str, meta_extra: dict | None = None) -> Optional[Dict[str, Any]]:
+    """
+    Extract tracks from Apple Music HTML DOM rows (data-testid="track-list-item" or role="row").
+    This is the primary extraction method for modern Apple Music Web UI.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    
+    tracks: list[dict] = []
+    playlist_name: str | None = None
+    
+    # Try to get playlist name from page title or meta tags
+    try:
+        if soup.title and soup.title.string:
+            playlist_name = _fix_mojibake(soup.title.string.strip())
+    except Exception:
+        pass
+    
+    if not playlist_name:
+        try:
+            og_title = soup.find("meta", property="og:title")
+            if og_title and og_title.get("content"):
+                playlist_name = og_title.get("content").strip()
+        except Exception:
+            pass
+    
+    # Look for track list rows: data-testid="track-list-item" or role="row"
+    # Start with data-testid which is more specific
+    row_selectors = [
+        lambda: soup.find_all(attrs={"data-testid": "track-list-item"}),
+        lambda: soup.find_all("div", attrs={"role": "row"}),
+    ]
+    
+    rows = []
+    for selector_fn in row_selectors:
+        try:
+            rows = selector_fn()
+            if rows:
+                logger.debug(f"[Apple DOM] Found {len(rows)} rows with selector")
+                break
+        except Exception:
+            continue
+    
+    if not rows:
+        logger.debug("[Apple DOM] No track rows found in HTML")
+        return None
+    
+    # Extract track information from each row
+    for row in rows:
+        try:
+            # Common pattern: track title and artist are in nested links or text elements
+            # Fallback: use aria-label or innerText
+            
+            title = None
+            artist = None
+            album = None
+            duration = None
+            track_url = None
+            
+            # Try aria-label first (often has "Title, Artist" format)
+            aria_label = row.get("aria-label", "")
+            if aria_label:
+                parts = [p.strip() for p in aria_label.split("、") if p.strip()]  # Japanese comma
+                if not parts:
+                    parts = [p.strip() for p in aria_label.split(",") if p.strip()]  # Western comma
+                if len(parts) >= 1:
+                    title = parts[0]
+                if len(parts) >= 2:
+                    artist = parts[1]
+            
+            # Look for links within the row
+            a_tags = row.select("a")
+
+            def _abs_url(href: str) -> str:
+                href = (href or "").strip()
+                if not href:
+                    return ""
+                if href.startswith("//"):
+                    return "https:" + href
+                if href.startswith("/"):
+                    return "https://music.apple.com" + href
+                if href.startswith("http://") or href.startswith("https://"):
+                    return href
+                if href.startswith("music.apple.com/"):
+                    return "https://" + href
+                return href
+
+            def _is_track_url(u: str) -> bool:
+                # Appleの曲リンクは /song/ か、/album/... ?i=... を含むことが多い
+                return ("/song/" in u) or ("?i=" in u)
+
+            def _is_artist_url(u: str) -> bool:
+                return "/artist/" in u
+
+            def _is_album_url(u: str) -> bool:
+                return ("/album/" in u) and ("?i=" not in u)
+
+            link_infos: list[tuple[str, str]] = []
+            for a in a_tags:
+                txt = a.get_text(" ", strip=True) or ""
+                href = _abs_url(a.get("href") or "")
+                if not href:
+                    continue
+                # textが空でも aria-label が入ってるケースがある
+                if not txt:
+                    aria = (a.get("aria-label") or "").strip()
+                    if aria:
+                        txt = aria
+                link_infos.append((txt, href))
+
+            # 1) 曲URL（apple_url）を優先抽出
+            track_url = ""
+            track_title = title or ""
+            for txt, href in link_infos:
+                if _is_track_url(href):
+                    track_url = href
+                    # aria-labelで取れない場合の保険
+                    if not track_title and txt:
+                        track_title = txt
+                    break
+
+            # 2) artist / album の推定
+            artist_name = ""
+            album_name = ""
+
+            for txt, href in link_infos:
+                if txt and _is_artist_url(href):
+                    artist_name = txt
+                    break
+
+            for txt, href in link_infos:
+                if txt and _is_album_url(href):
+                    album_name = txt
+                    break
+
+            # 3) album がリンクじゃない場合があるので gridcell テキストから補完
+            if not album_name:
+                cells = row.select("[role='gridcell']")
+                cell_texts = [c.get_text(" ", strip=True) for c in cells]
+                # title/artist と被らない “それっぽい” テキストを拾う
+                blacklist = {track_title.strip(), artist_name.strip()}
+                cand = [t for t in cell_texts if t and t.strip() not in blacklist]
+                if cand:
+                    album_name = cand[0].strip()
+
+            artist = artist_name
+            album = album_name
+            
+            # Fallback: extract from text content if links didn't provide enough
+            if not title:
+                all_text = row.get_text(separator=" ", strip=True)
+                # Very crude: first N words as title
+                words = all_text.split()
+                if words:
+                    title = " ".join(words[:3])  # First 3 words as fallback title
+            
+            # Try to find duration (ISO 8601 format: PT3M31S)
+            time_elem = row.find(attrs={"aria-label": lambda x: x and x.startswith("PT")})
+            if time_elem:
+                duration = time_elem.get("aria-label")
+            else:
+                # Look for duration pattern in any text
+                import re as regex_module
+                text = row.get_text()
+                duration_match = regex_module.search(r"PT(\d+M)?(\d+S)?", text)
+                if duration_match:
+                    duration = duration_match.group(0)
+            
+            # Only add if we have at least a title
+            if title:
+                title = _fix_mojibake(title)
+                if artist:
+                    artist = _fix_mojibake(artist)
+                if album:
+                    album = _fix_mojibake(album)
+                
+                track_dict = {
+                    "title": title,
+                    "artist": artist or "",
+                    "album": album or "",
+                    "apple_url": track_url or url,
+                }
+                if duration:
+                    track_dict["duration"] = duration
+                tracks.append(track_dict)
+                
+        except Exception as e:
+            logger.debug(f"[Apple DOM] Failed to extract track from row: {e}")
+            continue
+    
+    if not tracks:
+        logger.debug("[Apple DOM] No tracks extracted from rows")
+        return None
+    
+    return _build_apple_playlist_result(
+        tracks,
+        playlist_name or "Apple Music Playlist",
+        url,
+        meta_extra={**{"apple_strategy": "dom_rows"}, **(meta_extra or {})},
+    )
+
+
 def _parse_apple_html_payload(html: str, url: str, strategy_hint: str = "html", meta_extra: dict | None = None) -> Optional[Dict[str, Any]]:
     """Parse Apple Music HTML for embedded JSON and build playlist result."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1807,7 +2763,8 @@ async def fetch_playlist_tracks_generic(
     Returns dict with 'perf' key containing timing metrics.
     """
     import time
-    t0_total = time.time()
+    from time import perf_counter
+    t0_total = perf_counter()
     
     src = (source or "spotify").lower()
     perf = {
@@ -1818,7 +2775,7 @@ async def fetch_playlist_tracks_generic(
     }
     
     if src == "apple":
-        t0_fetch = time.time()
+        t0_fetch = perf_counter()
         apple_strategy = "html"
         result: Dict[str, Any] | None = None
         mode = (apple_mode or "auto").lower()
@@ -1843,8 +2800,8 @@ async def fetch_playlist_tracks_generic(
                 raise RuntimeError(f"Apple Music Playwright fetch timed out ({APPLE_PLAYWRIGHT_TIMEOUT_S}s) - try different URL or wait a few minutes for rate limit reset")
             except Exception as e:
                 raise RuntimeError(f"Apple Music fetch failed: {str(e)}")
-        t1_fetch = time.time()
-        perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
+        t1_fetch = perf_counter()
+        perf['fetch_ms'] = int((t1_fetch - t0_fetch) * 1000)
 
         # Determine enrichment default: if not specified, default False for Apple
         do_enrich = bool(enrich_spotify) if enrich_spotify is not None else False
@@ -1852,29 +2809,50 @@ async def fetch_playlist_tracks_generic(
         meta = result.get("meta") or {}
         meta["apple_strategy"] = apple_strategy
         if do_enrich:
-            t0_enrich = time.time()
+            t0_enrich = perf_counter()
             result = _enrich_apple_tracks_with_spotify(result)
-            t1_enrich = time.time()
-            perf['enrich_ms'] = (t1_enrich - t0_enrich) * 1000
+            t1_enrich = perf_counter()
+            perf['enrich_ms'] = int((t1_enrich - t0_enrich) * 1000)
         else:
             # Skip Spotify enrichment deliberately
             meta["apple_enrich_skipped"] = True
-            perf['enrich_ms'] = 0.0
+            perf['enrich_ms'] = 0
         result["meta"] = meta
 
-        result['perf'] = perf
-        t1_total = time.time()
-        perf['total_ms'] = (t1_total - t0_total) * 1000
+        t1_total = perf_counter()
+        perf['total_ms'] = int((t1_total - t0_total) * 1000)
         perf['tracks_count'] = len(result.get('items', []))
-        return result
-    else:
-        t0_fetch = time.time()
-        result = await asyncio.to_thread(fetch_playlist_tracks, url_or_id)
-        t1_fetch = time.time()
-        perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
-        
+        # ms系はすべてintで統一
+        for k in ["fetch_ms", "enrich_ms", "total_ms"]:
+            if k in perf:
+                perf[k] = int(perf[k])
         result['perf'] = perf
-        t1_total = time.time()
-        perf['total_ms'] = (t1_total - t0_fetch) * 1000
-        perf['tracks_count'] = len(result.get('items', []))
+        # items/tracksエイリアス正規化
+        if "items" not in result or result["items"] is None:
+            result["items"] = result.get("tracks") or []
+        result["tracks"] = result["items"]
+        # timings/apple_timingエイリアス正規化
+        meta = result.get("meta", {}) or {}
+        if "timings" not in meta:
+            if "apple_timing" in meta:
+                meta["timings"] = meta["apple_timing"]
+        result["meta"] = meta
         return result
+    t0_fetch = perf_counter()
+    result = await asyncio.to_thread(fetch_playlist_tracks, url_or_id)
+    t1_fetch = perf_counter()
+    perf['fetch_ms'] = int((t1_fetch - t0_fetch) * 1000)
+
+    t1_total = perf_counter()
+    perf['total_ms'] = int((t1_total - t0_total) * 1000)
+    perf['tracks_count'] = len(result.get('items', []))
+    # ms系はすべてintで統一
+    for k in ["fetch_ms", "enrich_ms", "total_ms"]:
+        if k in perf:
+            perf[k] = int(perf[k])
+    result['perf'] = perf
+    # items/tracksエイリアス正規化
+    if "items" not in result or result["items"] is None:
+        result["items"] = result.get("tracks") or []
+    result["tracks"] = result["items"]
+    return result

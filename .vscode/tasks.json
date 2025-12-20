@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "backend: start (apple debug)",
+      "type": "shell",
+      "command": "/bin/bash",
+      "args": ["-lc", "${workspaceFolder}/scripts/dev_backend_start.sh"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "backend: apple timing (Top 100 JP)",
+      "type": "shell",
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "URL='https://music.apple.com/jp/playlist/top-100-japan/pl.043a2c9876114d95a4659988497567be'; curl -sG 'http://127.0.0.1:8000/api/playlist' --data-urlencode \"url=$URL\" --data-urlencode 'source=apple' --data-urlencode 'refresh=1' | jq '.meta.apple_timing'"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": false
+      }
+    }
+  ]
+}

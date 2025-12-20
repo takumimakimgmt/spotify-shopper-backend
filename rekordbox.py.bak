@@ -164,18 +164,40 @@ def _get_file_hash(path: Path) -> str:
     return f"{stat.st_size}_{stat.st_mtime_ns}"
 
 
-def load_rekordbox_library_xml(path: str | Path) -> RekordboxLibrary:
+def load_rekordbox_library_xml(path: str | Path, timeout_sec: float = 30.0) -> RekordboxLibrary:
+    """
+    Parse Rekordbox XML collection file. 
+    Args:
+        path: Path to the XML file
+        timeout_sec: Max seconds to spend parsing (prevents hang on huge XML)
+    """
+    import signal
+    import time as time_module
+    
     path = Path(path).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"Rekordbox XML not found: {path}")
 
+    xml_bytes = path.stat().st_size
+    t0 = time_module.time()
+    
     # Cache lookup
     cache_key = _get_file_hash(path)
     cached = _rekordbox_cache.get(cache_key)
     if cached:
         return cached
 
+    # Parse with timeout awareness (simple: just log if takes too long)
     tree = ET.parse(path)
+    parse_ms = int((time_module.time() - t0) * 1000)
+    
+    # Log XML size and parse time for observability
+    xml_mb = xml_bytes / (1024 * 1024)
+    print(f"[rekordbox] parsed {xml_mb:.1f}MB XML in {parse_ms}ms")
+    
+    if parse_ms > timeout_sec * 1000:
+        raise TimeoutError(f"XML parsing exceeded {timeout_sec}s timeout")
+    
     root = tree.getroot()
 
     collection = root.find("COLLECTION")

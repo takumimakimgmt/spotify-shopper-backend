@@ -239,7 +239,18 @@ Response: Same as /api/playlist
 - ✅ Match reason tracking: isrc/exact/album/fuzzy
 - ✅ ISRC-optimized store links
 
-## 📝 Testing
+## 🧪 Unit Tests
+
+Run all tests:
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+**What's tested:**
+- `tests/test_normalizer.py`: Title, artist, album normalization logic
+- `tests/test_matcher.py`: ISRC priority, fuzzy matching, Rekordbox integration
+
+## 📝 Testing Playlists (Manual)
 
 **Test Spotify Playlist:**
 ```bash

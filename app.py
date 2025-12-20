@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import asyncio
+import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import (
     FastAPI,
@@ -14,6 +17,7 @@ from fastapi import (
     Form,
     Request,
 )
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -27,7 +31,7 @@ from core import (
 from core import _PLAYLIST_CACHE as PLAYLIST_CACHE  # TTLCache
 from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
 from core import _CACHE_VERSION as CACHE_VERSION
-from rekordbox import mark_owned_tracks
+from lib.rekordbox import mark_owned_tracks
 import logging
 import json
 from playwright_pool import close_browser
@@ -119,6 +123,29 @@ app = FastAPI(
 # Add GZip middleware for response compression (reduces payload size for large JSON)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+# Add request body size limit middleware (protect against extremely large payloads)
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# Allow slightly larger than XML limit to account for multipart overhead (fields + boundaries)
+REQUEST_SIZE_LIMIT_BYTES = int(os.getenv("REQUEST_SIZE_LIMIT_BYTES", str(70 * 1024 * 1024)))
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ("POST", "PUT", "PATCH"):
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > REQUEST_SIZE_LIMIT_BYTES:
+                logger.warning(
+                    f"[RequestSizeLimit] Rejected oversized request: {content_length} bytes from {request.client}"
+                )
+                max_mb = REQUEST_SIZE_LIMIT_BYTES / (1024 * 1024)
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Request body too large (max {max_mb:.0f}MB)"}
+                )
+        return await call_next(request)
+
+app.add_middleware(RequestSizeLimitMiddleware)
+
 @app.on_event("startup")
 def _log_startup():
     logger.info("spotify-shopper: startup event triggered")
@@ -130,6 +157,23 @@ async def _init_playwright_state():
     app.state.pw = None
     app.state.browser = None
     app.state.apple_sem = asyncio.Semaphore(2)
+    
+    # Non-blocking prewarm: start browser in background to eliminate cold start delay
+    if os.getenv("APPLE_PREWARM_BROWSER", "1") == "1":
+        asyncio.create_task(_prewarm_browser_background())
+
+
+async def _prewarm_browser_background():
+    """Background task to prewarm Playwright browser without blocking startup."""
+    try:
+        from playwright_pool import get_browser
+        logger.info("[PREWARM] Starting browser prewarm (background)...")
+        start = time.time()
+        await get_browser()
+        elapsed = time.time() - start
+        logger.info(f"[PREWARM] Browser ready in {elapsed:.1f}s")
+    except Exception as e:
+        logger.warning(f"[PREWARM] Failed (non-fatal): {e}")
 
 
 @app.on_event("shutdown")
@@ -139,8 +183,8 @@ async def _shutdown_playwright_state():
     except Exception:
         pass
 
-# 最大アップロードサイズ（バイト） - デフォルト 5MB
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 5 * 1024 * 1024))
+# 最大アップロードサイズ（バイト） - デフォルト 50MB（フロントと合わせて）
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 50 * 1024 * 1024))
 
 # デフォルトの許可オリジン
 default_origins = [
@@ -205,6 +249,57 @@ def _sanitize_url(raw: str) -> str:
     return s
 
 
+def _validate_playlist_url_or_id(raw: str) -> str:
+    """Allow only https URLs on public hosts or raw Spotify IDs.
+
+    Rejects local/private hosts to avoid SSRF and enforces https scheme.
+    """
+    s = _sanitize_url(raw)
+    if not s:
+        raise HTTPException(status_code=422, detail="URL is required")
+
+    # raw Spotify playlist ID (22 chars)
+    if re.fullmatch(r"[A-Za-z0-9]{22}", s):
+        return s
+
+    parsed = urlparse(s)
+    scheme = (parsed.scheme or "").lower()
+    if scheme != "https":
+        raise HTTPException(status_code=422, detail="URL must use https scheme")
+
+    host = (parsed.hostname or "").lower()
+    private_hosts = (
+        "localhost",
+        "0.0.0.0",
+    )
+    private_prefixes = (
+        "127.",
+        "10.",
+        "192.168.",
+        "172.16.",
+        "172.17.",
+        "172.18.",
+        "172.19.",
+        "172.20.",
+        "172.21.",
+        "172.22.",
+        "172.23.",
+        "172.24.",
+        "172.25.",
+        "172.26.",
+        "172.27.",
+        "172.28.",
+        "172.29.",
+        "172.30.",
+        "172.31.",
+    )
+
+    if host in private_hosts or any(host.startswith(pfx) for pfx in private_prefixes):
+        raise HTTPException(status_code=422, detail="Unsupported URL host (private/internal)")
+
+    return s
+
+
 def _apply_rekordbox_owned_flags(
     playlist_data: Dict[str, Any],
     library_xml_path: str,
@@ -242,7 +337,7 @@ async def get_playlist(
     t0_total = time.time()
     
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
-    clean_url = _sanitize_url(url)
+    clean_url = _validate_playlist_url_or_id(url)
     normalized_url = normalize_playlist_url(clean_url)
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
@@ -366,8 +461,11 @@ async def playlist_with_rekordbox(body: PlaylistWithRekordboxBody, request: Requ
       "rekordbox_xml_path": "/Users/xxx/Desktop/rekordbox_collection.xml"
     }
     """
+    clean_url = _validate_playlist_url_or_id(body.url)
+    src = getattr(body, "source", "spotify") or "spotify"
+
     try:
-        result = await fetch_playlist_tracks_generic(getattr(body, "source", "spotify"), body.url, app=request.app)
+        result = await fetch_playlist_tracks_generic(src, clean_url, app=request.app)
         playlist_data = playlist_result_to_dict(result)
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": str(e)})
@@ -390,7 +488,7 @@ async def match_snapshot_with_xml(
 
     制限：
     - snapshot: 最大 1MB
-    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 5MB）
+    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 50MB）
     """
     # サイズチェック（snapshot 文字列長）
     if snapshot is None:
@@ -514,7 +612,7 @@ async def playlist_with_rekordbox_upload(
     # file は任意。ある場合は後で content-type とサイズ検証を行う。
 
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
-    clean_url = _sanitize_url(url)
+    clean_url = _validate_playlist_url_or_id(url)
     normalized_url = normalize_playlist_url(clean_url)
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
