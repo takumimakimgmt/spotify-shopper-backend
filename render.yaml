@@ -18,6 +18,8 @@ services:
         value: JP,US,GB
       - key: ALLOWED_ORIGINS
         value: https://playlist-shopper.vercel.app,http://localhost:3000,http://127.0.0.1:3000
+      - key: ALLOWED_ORIGIN_REGEX
+        value: ^https://.*\.vercel\.app$|^https://playlist-shopper\.vercel\.app$|^https://spotify-shopper\.vercel\.app$|^http://localhost:3000$|^http://127\.0\.0\.1:3000$
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/.cache/ms-playwright
       - key: PYTHON_VERSION

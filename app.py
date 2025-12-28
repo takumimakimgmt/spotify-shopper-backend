@@ -180,15 +180,27 @@ if env_origins:
 else:
     origins = default_origins
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
+# CORS: Prefer regex for Vercel previews if provided
+origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX")
+if origin_regex:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=origin_regex,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    env_origins = os.getenv("ALLOWED_ORIGINS")
+    if env_origins:
+        origins = [o.strip() for o in env_origins.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 # =========================
 # Health check
 # =========================
