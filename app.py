@@ -674,6 +674,18 @@ async def playlist_with_rekordbox_upload(
 # Local dev entrypoint
 # =========================
 
+
+from typing import Dict
+
+@app.get("/api/health", include_in_schema=False)
+def api_health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+@app.get("/health", include_in_schema=False)
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
 if __name__ == "__main__":
     import uvicorn
 
