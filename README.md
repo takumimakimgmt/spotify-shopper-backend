@@ -7,7 +7,6 @@ A full-stack application to analyze Spotify and Apple Music playlists and match 
 ### Core Functionality
 - **Dual Source Support**: Spotify and Apple Music playlists
   - **Spotify**: Via Spotipy API with client credentials
-  - **Apple Music**: Playwright-based scraping with comprehensive metadata
 - **Metadata Preservation**: Apple Music metadata (artist, album) never overwritten by Spotify enrichment
 - **ISRC Enrichment**: Read-only ISRC enrichment from Spotify for better matching
 - **Rekordbox Integration**: Match playlists against your Rekordbox XML collection
@@ -38,7 +37,6 @@ spotify-shopper/
 
 **Key Dependencies:**
 - `spotipy` - Spotify API client
-- `playwright` - Apple Music scraping (headless browser)
 - `beautifulsoup4` - HTML parsing
 - `rapidfuzz` - Fuzzy matching (0.92 threshold)
 - `cachetools` - TTL caching for API responses
@@ -64,7 +62,6 @@ cd spotify-shopper
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install chromium
 
 export SPOTIFY_CLIENT_ID="your_id"
 export SPOTIFY_CLIENT_SECRET="your_secret"
@@ -86,8 +83,6 @@ buildCommand: |
   set -e
   echo "Installing Python dependencies..."
   pip install -r requirements.txt
-  echo "Installing Playwright browsers and dependencies..."
-  python -m playwright install --with-deps chromium
   echo "Build complete"
 startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
@@ -135,8 +130,6 @@ mark_owned_tracks() [rekordbox.py:265]
 Apple Music URL
     ↓
 fetch_apple_playlist_tracks_from_web() [core.py:497]
-    ├─ _fetch_with_playwright() [core.py:673]
-    │   └─ Launch Playwright, load playlist, extract 100 tracks
     ├─ Parse track data: title, artist, album, URLs
     └─ Return raw playlist
     ↓
@@ -216,15 +209,14 @@ Response: Same as /api/playlist
   - Workaround: Manually copy tracks to a public playlist
 
 ### Apple Music
-- **Slow First Load**: Playwright needs to load full page (~2-5 seconds)
+- **Slow First Load**: HTTP-only; no browser boot (~2-5 seconds)
 - **100-Track Limit**: Only fetches first 100 tracks from visible page
-- **Browser Installation**: Requires `playwright install chromium` during build
+- **No browser installation**: Requires `(removed)` during build
   - Render build command includes this automatically
 
 ## 🚀 Recent Improvements
 
 ### Phase 7: Error Message Enhancement
-- ✅ Render deployment fixed: Explicit Playwright browser installation
 - ✅ 37i9 detection: Shows proper message for official playlists
 - ✅ Bilingual errors: Japanese + English for all error cases
 - ✅ Deployment-aware: Helpful hints for cloud platform issues
