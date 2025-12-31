@@ -33,8 +33,6 @@ from core import _CACHE_VERSION as CACHE_VERSION
 from lib.rekordbox import mark_owned_tracks
 import logging
 import json
-from playwright_pool import close_browser
-
 # Basic logging configuration to ensure logger outputs appear in the terminal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
@@ -78,7 +76,7 @@ class PlaylistMetaModel(BaseModel):
     total_backend_ms: Optional[float] = None
     total_api_ms: Optional[float] = None
     # Apple-specific meta flags
-    apple_strategy: Optional[str] = None  # 'html' | 'playwright'
+    apple_strategy: Optional[str] = None  # 'html'
     apple_mode: Optional[str] = None  # 'auto' | 'fast' | 'legacy'
     apple_legacy_used: Optional[bool] = None
     apple_enrich_skipped: Optional[bool] = None
@@ -123,13 +121,13 @@ async def lifespan(app):
             await res
 
     # startup
-    for fn in (_log_startup, _init_playwright_state):
+    for fn in (_log_startup, ):
         await _maybe_await(fn)
 
     yield
 
     # shutdown
-    for fn in (_shutdown_playwright_state,):
+    for fn in ():
         await _maybe_await(fn)
 
 
@@ -167,62 +165,6 @@ def _log_startup():
     logger.info("spotify-shopper: startup event triggered")
 
 
-async def _init_playwright_state():
-    # Lazy init: create slots and semaphore only; browser starts on first Apple request
-    app.state.pw = None
-    app.state.browser = None
-    app.state.apple_sem = asyncio.Semaphore(2)
-
-
-async def _shutdown_playwright_state():
-    try:
-        await close_browser()
-    except Exception:
-        pass
-
-# 最大アップロードサイズ（バイト） - デフォルト 50MB（フロントと合わせて）
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 50 * 1024 * 1024))
-
-# デフォルトの許可オリジン
-default_origins = [
-    "http://localhost:3000",
-    "https://spotify-shopper.vercel.app",
-    "https://playlist-shopper.vercel.app",
-]
-
-# 環境変数 ALLOWED_ORIGINS があればそれを優先（カンマ区切り）
-env_origins = os.getenv("ALLOWED_ORIGINS")
-if env_origins:
-    origins = [o.strip() for o in env_origins.split(",") if o.strip()]
-else:
-    origins = default_origins
-
-# CORS: Prefer regex for Vercel previews if provided
-origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX")
-if origin_regex:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=origin_regex,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    env_origins = os.getenv("ALLOWED_ORIGINS")
-    if env_origins:
-        origins = [o.strip() for o in env_origins.split(",") if o.strip()]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-# =========================
-# Health check
-# =========================
-
-@app.get("/health", tags=["system"])
 def health() -> Dict[str, Any]:
     import os
     return {
@@ -288,6 +230,13 @@ async def get_playlist(
     enrich_spotify: Optional[int] = Query(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
     refresh: Optional[int] = Query(None, description="Bypass cache when set to 1"),
 ):
+    # Apple Music is deferred: do not accept Apple URLs/requests for now
+    if source == 'apple' or 'music.apple.com' in url or 'itunes.apple.com' in url:
+        raise HTTPException(
+            status_code=400,
+            detail='Apple Music is temporarily disabled (deferred).',
+        )
+
     """
     プレイリストだけを取得（Rekordbox 突き合わせなし）。
     """
@@ -395,7 +344,7 @@ async def get_playlist(
         if src == "apple" and not error_meta:
             try:
                 error_meta = {
-                    "apple_strategy": "playwright",
+                    "apple_strategy": "html",
                     "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
                 }
             except Exception:
@@ -620,7 +569,7 @@ async def playlist_with_rekordbox_upload(
         if src == "apple" and not error_meta:
             try:
                 error_meta = {
-                    "apple_strategy": "playwright",
+                    "apple_strategy": "html",
                     "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
                 }
             except Exception:
