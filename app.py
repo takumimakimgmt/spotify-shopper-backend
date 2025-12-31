@@ -1,4 +1,6 @@
 from __future__ import annotations
+import inspect
+from contextlib import asynccontextmanager
 
 import os
 import tempfile
@@ -112,10 +114,28 @@ class PlaylistWithRekordboxBody(BaseModel):
 # FastAPI app & CORS
 # =========================
 
+# cc:lifespan-migrated
+@asynccontextmanager
+async def lifespan(app):
+    async def _maybe_await(fn):
+        res = fn()
+        if inspect.isawaitable(res):
+            await res
+
+    # startup
+    for fn in (_log_startup, _init_playwright_state):
+        await _maybe_await(fn)
+
+    yield
+
+    # shutdown
+    for fn in (_shutdown_playwright_state,):
+        await _maybe_await(fn)
+
+
 app = FastAPI(
     title="Spotify Playlist Shopper",
-    version="1.0.0",
-)
+    version="1.0.0", lifespan=lifespan)
 
 # Add GZip middleware for response compression (reduces payload size for large JSON)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -143,12 +163,10 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RequestSizeLimitMiddleware)
 
-@app.on_event("startup")
 def _log_startup():
     logger.info("spotify-shopper: startup event triggered")
 
 
-@app.on_event("startup")
 async def _init_playwright_state():
     # Lazy init: create slots and semaphore only; browser starts on first Apple request
     app.state.pw = None
@@ -156,7 +174,6 @@ async def _init_playwright_state():
     app.state.apple_sem = asyncio.Semaphore(2)
 
 
-@app.on_event("shutdown")
 async def _shutdown_playwright_state():
     try:
         await close_browser()
