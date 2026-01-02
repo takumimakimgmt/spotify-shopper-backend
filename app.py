@@ -135,6 +135,20 @@ app = FastAPI(
     title="Spotify Playlist Shopper",
     version="1.0.0", lifespan=lifespan)
 
+
+# CORS: allow Vercel preview/prod + local dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Add GZip middleware for response compression (reduces payload size for large JSON)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
