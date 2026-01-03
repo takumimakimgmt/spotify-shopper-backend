@@ -7,7 +7,7 @@ import tempfile
 import asyncio
 from typing import Any, Dict, List, Optional, Literal
 
-from fastapi import (, Query
+from fastapi import (
     FastAPI,
     HTTPException,
     Query,
@@ -70,7 +70,7 @@ class PlaylistMetaModel(BaseModel):
     
     cache_hit: Optional[bool] = None
     cache_ttl_s: Optional[int] = None
-    refresh: Optional[int] = None
+    refresh: bool = Query(False, description="Bypass cache when true"),
     fetch_ms: Optional[float] = None
     enrich_ms: Optional[float] = None
     total_backend_ms: Optional[float] = None
