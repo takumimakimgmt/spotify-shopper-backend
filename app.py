@@ -7,7 +7,7 @@ import tempfile
 import asyncio
 from typing import Any, Dict, List, Optional, Literal
 
-from fastapi import (
+from fastapi import (, Query
     FastAPI,
     HTTPException,
     Query,
@@ -242,7 +242,7 @@ async def get_playlist(
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
     isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
     enrich_spotify: Optional[int] = Query(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
-    refresh: Optional[int] = Query(None, description="Bypass cache when set to 1"),
+    refresh: bool = Query(False),
 ):
     # Apple Music is deferred: do not accept Apple URLs/requests for now
     if source == 'apple' or 'music.apple.com' in url or 'itunes.apple.com' in url:
