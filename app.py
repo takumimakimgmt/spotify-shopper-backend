@@ -1,8 +1,93 @@
 from __future__ import annotations
+
+
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+_ENV = Path(__file__).resolve().parent / '.env'
+_ENV_LOCAL = Path(__file__).resolve().parent / '.env.local'
+if _ENV.exists():
+    load_dotenv(dotenv_path=_ENV, override=True)
+if _ENV_LOCAL.exists():
+    load_dotenv(dotenv_path=_ENV_LOCAL, override=True)
+
+# Upload size limit (bytes). Used by /api/playlist-with-rekordbox-upload.
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return int(v) if v else default
+    except Exception:
+        return default
+
+MAX_UPLOAD_SIZE = _env_int("MAX_UPLOAD_SIZE", 10 * 1024 * 1024)  # default 10MB
+
 import inspect
 from contextlib import asynccontextmanager
 
 import os
+
+
+def _sanitize_for_json(obj):
+    """Make objects JSON-serializable (Query/Param/dataclass/custom objects)."""
+    import dataclasses
+    import enum
+    import decimal
+    from datetime import date, datetime
+    from pathlib import Path as _Path
+
+    try:
+        from fastapi.params import Param
+    except Exception:
+        Param = ()  # type: ignore
+
+    if Param and isinstance(obj, Param):
+        return _sanitize_for_json(getattr(obj, "default", None))
+
+    if dataclasses.is_dataclass(obj):
+        return _sanitize_for_json(dataclasses.asdict(obj))
+
+    if isinstance(obj, enum.Enum):
+        return _sanitize_for_json(obj.value)
+
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+
+    if isinstance(obj, _Path):
+        return str(obj)
+
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_json(v) for v in obj]
+
+    if hasattr(obj, "model_dump"):  # pydantic v2
+        return _sanitize_for_json(obj.model_dump())
+
+    if hasattr(obj, "dict"):  # pydantic v1
+        return _sanitize_for_json(obj.dict())
+
+    if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+        return _sanitize_for_json(obj.to_dict())
+
+    if hasattr(obj, "__dict__"):
+        data = {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+        return _sanitize_for_json(data)
+
+    # last resort: try string
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 import tempfile
 import asyncio
 from typing import Any, Dict, List, Optional, Literal
@@ -70,7 +155,7 @@ class PlaylistMetaModel(BaseModel):
     
     cache_hit: Optional[bool] = None
     cache_ttl_s: Optional[int] = None
-    refresh: bool = Query(False, description="Bypass cache when true"),
+    refresh: bool = False
     fetch_ms: Optional[float] = None
     enrich_ms: Optional[float] = None
     total_backend_ms: Optional[float] = None
@@ -242,7 +327,7 @@ async def get_playlist(
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
     isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
     enrich_spotify: Optional[int] = Query(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
-    refresh: bool = Query(False),
+    refresh: bool = False
 ):
     # Apple Music is deferred: do not accept Apple URLs/requests for now
     if source == 'apple' or 'music.apple.com' in url or 'itunes.apple.com' in url:
@@ -392,7 +477,7 @@ async def playlist_with_rekordbox(body: PlaylistWithRekordboxBody, request: Requ
         playlist_data,
         body.rekordbox_xml_path,
     )
-    return playlist_with_owned
+    return JSONResponse(content=_sanitize_for_json(playlist_with_owned))
 
 
 @app.post("/api/match-snapshot-with-xml")
@@ -646,10 +731,7 @@ async def playlist_with_rekordbox_upload(
         f"cache_hit={'true' if 'cache_hit' in locals() and cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} cache_size={len(PLAYLIST_CACHE)} refresh={'1' if (refresh == 1) else '0'} "
         f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} tracks={tracks_count}"
     )
-    
-    return playlist_with_owned
-
-
+    return JSONResponse(content=_sanitize_for_json(playlist_with_owned))
 # =========================
 # Local dev entrypoint
 # =========================
