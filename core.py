@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import urllib.parse
+import threading
 from typing import Any, Dict, List, Optional
 import logging
 import asyncio
@@ -225,30 +226,40 @@ def _fix_mojibake(s: str) -> str:
 # Spotify クライアント
 # =========================
 
+_SPOTIFY_CLIENT = None  # type: ignore
+_SPOTIFY_CLIENT_LOCK = threading.Lock()
 
 def get_spotify_client() -> spotipy.Spotify:
     """
-    環境変数から Spotify API のクレデンシャルを読み込み、
-    Spotipy クライアントを返す。
+    Spotify API client (singleton).
 
-    必要な環境変数:
+    Requires:
     - SPOTIFY_CLIENT_ID
     - SPOTIFY_CLIENT_SECRET
     """
+    global _SPOTIFY_CLIENT
+
+    if _SPOTIFY_CLIENT is not None:
+        return _SPOTIFY_CLIENT
+
     client_id = os.getenv("SPOTIFY_CLIENT_ID")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-
     if not client_id or not client_secret:
         raise RuntimeError(
             "Spotify client credentials are not set. "
             "Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."
         )
 
-    auth_manager = SpotifyClientCredentials(
-        client_id=client_id,
-        client_secret=client_secret,
-    )
-    return spotipy.Spotify(auth_manager=auth_manager)
+    with _SPOTIFY_CLIENT_LOCK:
+        if _SPOTIFY_CLIENT is not None:
+            return _SPOTIFY_CLIENT
+
+        auth_manager = SpotifyClientCredentials(
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        _SPOTIFY_CLIENT = spotipy.Spotify(auth_manager=auth_manager)
+        return _SPOTIFY_CLIENT
 
 
 # =========================
@@ -368,12 +379,16 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     
     sp = get_spotify_client()
 
+    meta: Dict[str, Any] = {}
+
     # プレイリストメタ情報
+    t0_pl = time.perf_counter()
     try:
         playlist = sp.playlist(
             playlist_id,
             fields="id,name,external_urls,owner.id",
         )
+        meta['spotify_playlist_ms'] = (time.perf_counter() - t0_pl) * 1000
     except SpotifyException as e:
         status = getattr(e, "http_status", None)
         msg = getattr(e, "msg", str(e))
@@ -398,6 +413,8 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     # トラック全件（100曲以上にも対応）。市場（market）を指定して可用性差異に対応。
     owner_id = (playlist.get("owner") or {}).get("id") if isinstance(playlist.get("owner"), dict) else None
     is_official_edit = (owner_id == "spotify")
+    meta['spotify_owner_id'] = owner_id
+    meta['spotify_official_edit'] = bool(is_official_edit)
     # 優先順は環境変数 SPOTIFY_MARKET（カンマ区切り可）、なければ JP,US,GB.
     market_env = os.getenv("SPOTIFY_MARKET", "").strip()
     markets: List[str] = [m.strip().upper() for m in market_env.split(",") if m.strip()] or ["JP", "US", "GB"]
@@ -405,8 +422,12 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     last_error: Exception | None = None
     items: List[Dict[str, Any]] = []
     results = None
+    t_tracks0 = time.perf_counter()
+    pages = 0
+    used_market: str | None = None
     for market in markets:
         try:
+            used_market = market
             # Fetch only necessary fields to reduce payload size and improve latency
             results = sp.playlist_tracks(
                 playlist_id,
@@ -415,17 +436,22 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
                 market=market,
                 fields="items(track(id,name,artists(name),external_urls.spotify,is_local,external_ids.isrc,album(name))),next"
             )
+            pages += 1
             items.extend(results.get("items", []))
             # paginate
             while results.get("next"):
                 try:
                     results = sp.next(results)
+                    pages += 1
                 except SpotifyException as e:
                     status = getattr(e, "http_status", None)
                     msg = getattr(e, "msg", str(e))
                     raise RuntimeError(f"Failed to fetch next page of tracks ({status}) for market {market}: {msg}")
                 items.extend(results.get("items", []))
             # success for this market
+            meta['spotify_market'] = used_market
+            meta['spotify_pages'] = pages
+            meta['spotify_tracks_ms'] = (time.perf_counter() - t_tracks0) * 1000
             break
         except SpotifyException as e:
             last_error = e
@@ -1012,6 +1038,6 @@ async def fetch_playlist_tracks_generic(
         
         result['perf'] = perf
         t1_total = time.time()
-        perf['total_ms'] = (t1_total - t0_fetch) * 1000
+        perf['total_ms'] = (t1_total - t0_total) * 1000
         perf['tracks_count'] = len(result.get('items', []))
         return result
