@@ -2,6 +2,7 @@
 プレイリストとREkordboxライブラリのマッチング。
 判定の優先順: ISRC → 正規化タイトル+アーティスト → 正規化タイトル+アルバム → Fuzzy タイトル
 """
+
 from __future__ import annotations
 
 from difflib import SequenceMatcher
@@ -9,8 +10,6 @@ from pathlib import Path
 import time
 
 from lib.rekordbox.models import (
-    RekordboxLibrary,
-    RekordboxTrack,
     OwnedDetail,
     MatchMethod,
 )
@@ -136,7 +135,9 @@ def mark_owned_tracks(
 
     match_ms = int((time.time() - t0_match) * 1000)
     track_total = len(playlist_data.get("tracks", []))
-    print(f"[rekordbox] match tracks={track_total} fuzzy={fuzzy_count} match_ms={match_ms}ms")
+    print(
+        f"[rekordbox] match tracks={track_total} fuzzy={fuzzy_count} match_ms={match_ms}ms"
+    )
 
     playlist_data.setdefault("meta", {})["rekordbox"] = {
         "track_total": track_total,

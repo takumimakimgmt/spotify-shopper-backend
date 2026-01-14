@@ -1,4 +1,5 @@
 """Centralized cache utilities (TTLCache settings & key builders)."""
+
 from __future__ import annotations
 
 import os
@@ -16,7 +17,9 @@ _rekordbox_cache: TTLCache | None = None
 def get_rekordbox_cache() -> TTLCache:
     global _rekordbox_cache
     if _rekordbox_cache is None:
-        _rekordbox_cache = TTLCache(maxsize=REKORDBOX_CACHE_MAXSIZE, ttl=REKORDBOX_CACHE_TTL_S)
+        _rekordbox_cache = TTLCache(
+            maxsize=REKORDBOX_CACHE_MAXSIZE, ttl=REKORDBOX_CACHE_TTL_S
+        )
     return _rekordbox_cache
 
 

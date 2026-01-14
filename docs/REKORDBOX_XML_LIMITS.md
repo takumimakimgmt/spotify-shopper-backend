@@ -17,7 +17,7 @@ Default: `50` (MB)
 
 ### Rationale
 
-- **Data Point**: 2,226 tracks ≈ 2.39 MB  
+- **Data Point**: 2,226 tracks ≈ 2.39 MB
   Extrapolation: ~50,000 tracks ≈ ~50 MB (largest personal library)
 - **50 MB Limit Benefits**:
   - Safe margin for most users (up to ~50,000 tracks)
@@ -29,7 +29,7 @@ Default: `50` (MB)
 
 When file exceeds limit:
 ```
-OverflowError: Rekordbox XML exceeds 50MB limit (55.3MB). 
+OverflowError: Rekordbox XML exceeds 50MB limit (55.3MB).
 See docs/REKORDBOX_XML_LIMITS.md for guidance.
 ```
 

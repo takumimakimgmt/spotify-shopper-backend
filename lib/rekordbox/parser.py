@@ -1,6 +1,7 @@
 """
 Rekordbox XML パーサー。ファイルの読み込みとインデックス構築を担当。
 """
+
 from __future__ import annotations
 
 import os
@@ -20,6 +21,7 @@ from lib.rekordbox.normalizer import (
 
 # XML ファイルサイズ上限（環境変数で設定可能、デフォルト: 50 MB）
 MAX_XML_SIZE_BYTES = int(os.getenv("REKORDBOX_MAX_XML_MB", "50")) * 1024 * 1024
+
 
 def _get_file_hash(path: Path) -> str:
     """Use file size and mtime as a cheap cache key."""
@@ -52,7 +54,7 @@ def load_rekordbox_library_xml(
         raise FileNotFoundError(f"Rekordbox XML not found: {path}")
 
     xml_bytes = path.stat().st_size
-    
+
     # File size guard
     if xml_bytes > MAX_XML_SIZE_BYTES:
         raise OverflowError(

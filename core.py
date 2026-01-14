@@ -21,6 +21,7 @@ import asyncio
 import requests
 import httpx
 import html as _html
+
 try:
     from bs4 import BeautifulSoup
 except Exception:  # pragma: no cover
@@ -38,12 +39,15 @@ _CACHE_VERSION = "v2"  # v2: includes apple_mode in cache keys
 _PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=_TTL_SECONDS)
 APPLE_HTTP_TIMEOUT_S = float(os.getenv("APPLE_HTTP_TIMEOUT_S", "20"))
 APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
-APPLE_removed_browser_TIMEOUT_S = float(os.getenv("APPLE_removed_browser_TIMEOUT_S", "95"))
+APPLE_removed_browser_TIMEOUT_S = float(
+    os.getenv("APPLE_removed_browser_TIMEOUT_S", "95")
+)
 APPLE_DEBUG_HTML = os.getenv("APPLE_DEBUG_HTML", "0") == "1"
 APPLE_PW_COMMIT_TIMEOUT_MS = int(os.getenv("APPLE_PW_COMMIT_TIMEOUT_MS", "20000"))
 APPLE_PW_DOM_TIMEOUT_MS = int(os.getenv("APPLE_PW_DOM_TIMEOUT_MS", "7000"))
 APPLE_PW_NET_WAIT_MS = int(os.getenv("APPLE_PW_NET_WAIT_MS", "35000"))
 APPLE_PW_NO_BLOCK = os.getenv("APPLE_PW_NO_BLOCK", "0") == "1"
+
 
 def normalize_playlist_url(url: str) -> str:
     """Normalize playlist URL for canonical cache key.
@@ -56,7 +60,11 @@ def normalize_playlist_url(url: str) -> str:
         if not s:
             return ""
         parsed = urlparse(s)
-        q = {k: v for k, v in parse_qsl(parsed.query) if not (k == "si" or k == "fbclid" or k == "gclid" or k.startswith("utm_"))}
+        q = {
+            k: v
+            for k, v in parse_qsl(parsed.query)
+            if not (k == "si" or k == "fbclid" or k == "gclid" or k.startswith("utm_"))
+        }
         new_query = urlencode(q)
         path = parsed.path or ""
         # Spotify canonicalization
@@ -72,10 +80,13 @@ def normalize_playlist_url(url: str) -> str:
         # Ensure no trailing stuff beyond canonical path and unify trailing slash removal
         if path.endswith("/"):
             path = path[:-1]
-        normalized = urlunparse((parsed.scheme or "https", parsed.netloc or "", path, "", new_query, ""))
+        normalized = urlunparse(
+            (parsed.scheme or "https", parsed.netloc or "", path, "", new_query, "")
+        )
         return normalized
     except Exception:
         return url
+
 
 import unicodedata
 
@@ -117,19 +128,21 @@ def _fix_mojibake(s: str) -> str:
         return s
 
     # quick sanity: if ASCII-only and no typical mojibake markers, skip work
-    if re.fullmatch(r"[\x00-\x7f]*", s) and not re.search(r'[ÃÂãâ]', s):
+    if re.fullmatch(r"[\x00-\x7f]*", s) and not re.search(r"[ÃÂãâ]", s):
         return s
 
     def count_cjk(text: str) -> int:
         # basic coverage of common CJK blocks
-        return len(re.findall(r'[\u4E00-\u9FFF\u3040-\u30FF\u31F0-\u31FF\u3000-\u303F]', text))
+        return len(
+            re.findall(r"[\u4E00-\u9FFF\u3040-\u30FF\u31F0-\u31FF\u3000-\u303F]", text)
+        )
 
     def count_replacement(text: str) -> int:
-        return text.count('\ufffd') + text.count('�')
+        return text.count("\ufffd") + text.count("�")
 
     def mojibake_marker_score(text: str) -> int:
         # penalize presence of common mojibake glyphs
-        return sum(text.count(x) for x in ['Ã', 'Â', 'â', 'ã'])
+        return sum(text.count(x) for x in ["Ã", "Â", "â", "ã"])
 
     def score_candidate(text: str) -> int:
         # higher is better
@@ -159,14 +172,16 @@ def _fix_mojibake(s: str) -> str:
 
     # latin1 -> utf-8
     try:
-        candidates.append(s.encode('latin1').decode('utf-8'))
+        candidates.append(s.encode("latin1").decode("utf-8"))
     except Exception:
         pass
 
     # try an additional windows-1252-like route: treat bytes as latin1 then decode utf-8
     try:
         # same as above but keep in candidates for scoring
-        candidates.append(s.encode('latin1', errors='replace').decode('utf-8', errors='replace'))
+        candidates.append(
+            s.encode("latin1", errors="replace").decode("utf-8", errors="replace")
+        )
     except Exception:
         pass
 
@@ -186,7 +201,9 @@ def _fix_mojibake(s: str) -> str:
                 tries.add(cand)
                 candidates.append(cand)
             try:
-                repaired = cand.encode('latin1', errors='replace').decode('utf-8', errors='replace')
+                repaired = cand.encode("latin1", errors="replace").decode(
+                    "utf-8", errors="replace"
+                )
                 if repaired not in tries:
                     tries.add(repaired)
                     candidates.append(repaired)
@@ -215,7 +232,7 @@ def _fix_mojibake(s: str) -> str:
 
     # final normalization
     try:
-        best = unicodedata.normalize('NFC', best)
+        best = unicodedata.normalize("NFC", best)
     except Exception:
         pass
 
@@ -228,6 +245,7 @@ def _fix_mojibake(s: str) -> str:
 
 _SPOTIFY_CLIENT = None  # type: ignore
 _SPOTIFY_CLIENT_LOCK = threading.Lock()
+
 
 def get_spotify_client() -> spotipy.Spotify:
     """
@@ -265,10 +283,12 @@ def get_spotify_client() -> spotipy.Spotify:
 # =========================
 # プレイリストID抽出
 # =========================
-def build_store_links(title: str, artist: str, album: str | None = None, isrc: str | None = None) -> Dict[str, str]:
+def build_store_links(
+    title: str, artist: str, album: str | None = None, isrc: str | None = None
+) -> Dict[str, str]:
     """
     Beatport / Bandcamp / iTunes (Apple Music) の検索リンクを生成。
-    
+
     優先順位:
     - Beatport: title + artist を最優先（Beatport は ISRC よりテキスト検索が強いため）
       - title が無い場合は artist のみ、どちらも無ければ ISRC を最後の手段として使用
@@ -280,12 +300,21 @@ def build_store_links(title: str, artist: str, album: str | None = None, isrc: s
     isrc_clean = isrc.strip().upper() if isrc else None
 
     # Beatport: prefer human-readable query (title + artist), then title-only, then ISRC.
-    beatport_query = f"{title_clean} {artist_clean}".strip() or title_clean or artist_clean or (isrc_clean or "")
-    beatport = f"https://www.beatport.com/search?q={urllib.parse.quote_plus(beatport_query)}"
+    beatport_query = (
+        f"{title_clean} {artist_clean}".strip()
+        or title_clean
+        or artist_clean
+        or (isrc_clean or "")
+    )
+    beatport = (
+        f"https://www.beatport.com/search?q={urllib.parse.quote_plus(beatport_query)}"
+    )
 
     # Bandcamp: still title + artist (ISRC not supported)
     bandcamp_query = f"{title_clean} {artist_clean}".strip()
-    bandcamp = f"https://bandcamp.com/search?q={urllib.parse.quote_plus(bandcamp_query)}"
+    bandcamp = (
+        f"https://bandcamp.com/search?q={urllib.parse.quote_plus(bandcamp_query)}"
+    )
 
     # iTunes: ISRC when available, otherwise title + artist
     if isrc_clean:
@@ -357,7 +386,7 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     実際に使いやすい dict への変換は playlist_result_to_dict() で行う。
     """
     playlist_id = extract_playlist_id(url_or_id)
-    
+
     # Early detection: Check if this is an official editorial playlist (37i9...)
     if re.match(r"^37i9", playlist_id):
         logger.warning(f"[Spotify] Detected official editorial playlist: {playlist_id}")
@@ -376,7 +405,7 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
             "2. Copy all tracks from this playlist\n"
             "3. Use the new playlist URL instead"
         )
-    
+
     sp = get_spotify_client()
 
     meta: Dict[str, Any] = {}
@@ -388,7 +417,7 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
             playlist_id,
             fields="id,name,external_urls,owner.id",
         )
-        meta['spotify_playlist_ms'] = (time.perf_counter() - t0_pl) * 1000
+        meta["spotify_playlist_ms"] = (time.perf_counter() - t0_pl) * 1000
     except SpotifyException as e:
         status = getattr(e, "http_status", None)
         msg = getattr(e, "msg", str(e))
@@ -406,18 +435,26 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
             raise RuntimeError(
                 "Failed to fetch this playlist from Spotify API ({}). "
                 "This may be a private or personalized playlist (e.g., Daily Mix / On Repeat / Blend) requiring user authentication, "
-                "or region-restricted.{} Original error: {}".format(status, editorial_hint, msg)
+                "or region-restricted.{} Original error: {}".format(
+                    status, editorial_hint, msg
+                )
             )
         raise RuntimeError(f"Failed to fetch playlist metadata: {msg}")
 
     # トラック全件（100曲以上にも対応）。市場（market）を指定して可用性差異に対応。
-    owner_id = (playlist.get("owner") or {}).get("id") if isinstance(playlist.get("owner"), dict) else None
-    is_official_edit = (owner_id == "spotify")
-    meta['spotify_owner_id'] = owner_id
-    meta['spotify_official_edit'] = bool(is_official_edit)
+    owner_id = (
+        (playlist.get("owner") or {}).get("id")
+        if isinstance(playlist.get("owner"), dict)
+        else None
+    )
+    is_official_edit = owner_id == "spotify"
+    meta["spotify_owner_id"] = owner_id
+    meta["spotify_official_edit"] = bool(is_official_edit)
     # 優先順は環境変数 SPOTIFY_MARKET（カンマ区切り可）、なければ JP,US,GB.
     market_env = os.getenv("SPOTIFY_MARKET", "").strip()
-    markets: List[str] = [m.strip().upper() for m in market_env.split(",") if m.strip()] or ["JP", "US", "GB"]
+    markets: List[str] = [
+        m.strip().upper() for m in market_env.split(",") if m.strip()
+    ] or ["JP", "US", "GB"]
 
     last_error: Exception | None = None
     items: List[Dict[str, Any]] = []
@@ -434,7 +471,7 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
                 limit=100,
                 offset=0,
                 market=market,
-                fields="items(track(id,name,artists(name),external_urls.spotify,is_local,external_ids.isrc,album(name))),next"
+                fields="items(track(id,name,artists(name),external_urls.spotify,is_local,external_ids.isrc,album(name))),next",
             )
             pages += 1
             items.extend(results.get("items", []))
@@ -446,12 +483,14 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
                 except SpotifyException as e:
                     status = getattr(e, "http_status", None)
                     msg = getattr(e, "msg", str(e))
-                    raise RuntimeError(f"Failed to fetch next page of tracks ({status}) for market {market}: {msg}")
+                    raise RuntimeError(
+                        f"Failed to fetch next page of tracks ({status}) for market {market}: {msg}"
+                    )
                 items.extend(results.get("items", []))
             # success for this market
-            meta['spotify_market'] = used_market
-            meta['spotify_pages'] = pages
-            meta['spotify_tracks_ms'] = (time.perf_counter() - t_tracks0) * 1000
+            meta["spotify_market"] = used_market
+            meta["spotify_pages"] = pages
+            meta["spotify_tracks_ms"] = (time.perf_counter() - t_tracks0) * 1000
             break
         except SpotifyException as e:
             last_error = e
@@ -466,7 +505,11 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     if results is None or (not items and last_error is not None):
         # Exhausted markets
         status = getattr(last_error, "http_status", None) if last_error else None
-        msg = getattr(last_error, "msg", str(last_error)) if last_error else "Unknown error"
+        msg = (
+            getattr(last_error, "msg", str(last_error))
+            if last_error
+            else "Unknown error"
+        )
         prefix = "Failed to fetch playlist tracks from Spotify API. "
         if is_official_edit:
             prefix += "This looks like an official editorial playlist (owner=spotify). "
@@ -496,22 +539,28 @@ def _generate_track_key_primary(isrc: str | None) -> str | None:
     return None
 
 
-def _generate_track_key_fallback(title: str, artist: str, album: str | None = None) -> str:
+def _generate_track_key_fallback(
+    title: str, artist: str, album: str | None = None
+) -> str:
     """Generate fallback track key using normalized fields.
-    
+
     Escapes pipe and backslash characters to prevent delimiter collision.
     Safe to split by '|' for reconstruction.
     """
-    from lib.rekordbox.normalizer import normalize_title_base, normalize_artist, normalize_album
-    
+    from lib.rekordbox.normalizer import (
+        normalize_title_base,
+        normalize_artist,
+        normalize_album,
+    )
+
     def _sanitize_field(s: str) -> str:
         """Escape delimiter characters for track_key safety"""
         return s.replace("\\", "＼").replace("|", "／")
-    
+
     t_norm = _sanitize_field(normalize_title_base(title))
     a_norm = _sanitize_field(normalize_artist(artist))
     alb_norm = _sanitize_field(normalize_album(album or ""))
-    
+
     # Deterministic key for Buylist state matching (pipe-delimited, fields escaped)
     if alb_norm:
         return f"norm:{t_norm}|{a_norm}|{alb_norm}"
@@ -605,13 +654,19 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         isrc = (track.get("external_ids") or {}).get("isrc")  # ISRC from Spotify
 
         links = build_store_links(title, artist_name, album_name, isrc=isrc)
-        
+
         # Generate deterministic track keys for Buylist state management
         track_key_primary = _generate_track_key_primary(isrc)
-        track_key_fallback = _generate_track_key_fallback(title, artist_name, album_name)
-        
+        track_key_fallback = _generate_track_key_fallback(
+            title, artist_name, album_name
+        )
+
         # Determine primary type: ISRC takes precedence, else fallback
-        track_key_primary_type = "isrc" if track_key_primary and track_key_primary.startswith("isrc:") else "norm"
+        track_key_primary_type = (
+            "isrc"
+            if track_key_primary and track_key_primary.startswith("isrc:")
+            else "norm"
+        )
         final_primary = track_key_primary or track_key_fallback
 
         tracks_out.append(
@@ -639,17 +694,24 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --- ISRC enrichment helpers ---
-def _mb_search_recording(title: str, artist: str, album: str | None = None) -> dict | None:
-    import requests
+def _mb_search_recording(
+    title: str, artist: str, album: str | None = None
+) -> dict | None:
     from urllib.parse import quote
 
     query_parts = [f'recording:"{title}"', f'artist:"{artist}"']
     if album:
         query_parts.append(f'release:"{album}"')
     query = " AND ".join(query_parts)
-    url = f"https://musicbrainz.org/ws/2/recording?query={quote(query)}&fmt=json&limit=3"
+    url = (
+        f"https://musicbrainz.org/ws/2/recording?query={quote(query)}&fmt=json&limit=3"
+    )
     try:
-        res = requests.get(url, headers={"User-Agent": "spotify-shopper/1.0 (ISRC enrichment)"}, timeout=10)
+        res = requests.get(
+            url,
+            headers={"User-Agent": "spotify-shopper/1.0 (ISRC enrichment)"},
+            timeout=10,
+        )
         if res.status_code != 200:
             return None
         data = res.json()
@@ -678,7 +740,11 @@ def enrich_isrc_for_items(items: list, limit: int | None = None) -> int:
         if isrc:
             continue
         title = track.get("name") or track.get("title")
-        album = (track.get("album") or {}).get("name") if isinstance(track.get("album"), dict) else track.get("album")
+        album = (
+            (track.get("album") or {}).get("name")
+            if isinstance(track.get("album"), dict)
+            else track.get("album")
+        )
         artists = track.get("artists") or []
         artist_name = None
         if isinstance(artists, list) and artists:
@@ -701,42 +767,42 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     Takes an Apple Music playlist result and enriches each track with ISRC
     by searching Spotify for matching tracks.
-    
+
     This preserves Apple's original artist/album/URL metadata completely.
-    
+
     NOTE: ISRC enrichment is skipped by default (1-by-1 search is too slow ~200ms/track).
     Set APPLE_ENRICH_ISRC=1 env var to enable.
     """
     # Skip ISRC enrichment for performance (can be re-enabled via env var if needed)
-    if not os.getenv("APPLE_ENRICH_ISRC", "").lower() in ("1", "true", "yes"):
+    if os.getenv("APPLE_ENRICH_ISRC", "").lower() not in ("1", "true", "yes"):
         return result
-    
+
     try:
         sp = get_spotify_client()
     except Exception:
         # If Spotify client unavailable, return as-is (ISRC will remain null)
         return result
-    
+
     items = result.get("items", [])
     enriched_items = []
-    
+
     for item in items:
         track = item.get("track", {})
         title = track.get("name", "").strip()
         artists = track.get("artists", [])
         artist_name = artists[0].get("name", "").strip() if artists else ""
-        
+
         # Skip enrichment if no title or artist (low match accuracy)
         if not title or not artist_name:
             enriched_items.append(item)
             continue
-        
+
         # Search Spotify for ISRC
         try:
             query = f"track:{title} artist:{artist_name}"
             results = sp.search(q=query, type="track", limit=1)
             tracks = results.get("tracks", {}).get("items", [])
-            
+
             if tracks:
                 # Extract ISRC only (preserve all Apple metadata)
                 sp_track = tracks[0]
@@ -748,9 +814,9 @@ def _enrich_apple_tracks_with_spotify(result: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             # On search error, keep original track data without ISRC
             pass
-        
+
         enriched_items.append({"track": track})
-    
+
     result["items"] = enriched_items
     return result
 
@@ -764,30 +830,46 @@ def _extract_tracks_from_json_tree(node: Any) -> tuple[list[dict], str | None]:
     playlist_name: str | None = None
     seen: set[tuple[str, str, str]] = set()
 
-    def add_track(title: str | None, artist: str | None, album: str | None, url: str | None) -> None:
+    def add_track(
+        title: str | None, artist: str | None, album: str | None, url: str | None
+    ) -> None:
         if not title or not artist:
             return
-        key = (title.strip().lower(), artist.strip().lower(), (album or "").strip().lower())
+        key = (
+            title.strip().lower(),
+            artist.strip().lower(),
+            (album or "").strip().lower(),
+        )
         if key in seen:
             return
         seen.add(key)
-        tracks.append({
-            "title": _fix_mojibake(title.strip()),
-            "artist": _fix_mojibake(artist.strip()),
-            "album": _fix_mojibake(album.strip()) if album else "",
-            "apple_url": url or "",
-        })
+        tracks.append(
+            {
+                "title": _fix_mojibake(title.strip()),
+                "artist": _fix_mojibake(artist.strip()),
+                "album": _fix_mojibake(album.strip()) if album else "",
+                "apple_url": url or "",
+            }
+        )
 
     def walk(obj: Any):
         nonlocal playlist_name
         if isinstance(obj, dict):
             # Playlist name candidate
             if playlist_name is None:
-                name = obj.get("playlistName") or obj.get("name") or (obj.get("attributes") or {}).get("name")
+                name = (
+                    obj.get("playlistName")
+                    or obj.get("name")
+                    or (obj.get("attributes") or {}).get("name")
+                )
                 if isinstance(name, str) and name.strip():
                     playlist_name = _fix_mojibake(name.strip())
 
-            attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else None
+            attrs = (
+                obj.get("attributes")
+                if isinstance(obj.get("attributes"), dict)
+                else None
+            )
             if attrs:
                 title = attrs.get("name") or attrs.get("title")
                 artist = attrs.get("artistName") or attrs.get("artist")
@@ -796,13 +878,24 @@ def _extract_tracks_from_json_tree(node: Any) -> tuple[list[dict], str | None]:
                     or attrs.get("collectionName")
                     or attrs.get("albumTitle")
                 )
-                url = attrs.get("url") or attrs.get("shareUrl") or attrs.get("permalink")
+                url = (
+                    attrs.get("url") or attrs.get("shareUrl") or attrs.get("permalink")
+                )
                 if title and artist:
                     add_track(title, artist, album, url)
 
             # Direct dict with name/artist keys
-            if "name" in obj and "artistName" in obj and isinstance(obj.get("name"), str):
-                add_track(obj.get("name"), obj.get("artistName"), obj.get("albumName") or obj.get("collectionName"), obj.get("url"))
+            if (
+                "name" in obj
+                and "artistName" in obj
+                and isinstance(obj.get("name"), str)
+            ):
+                add_track(
+                    obj.get("name"),
+                    obj.get("artistName"),
+                    obj.get("albumName") or obj.get("collectionName"),
+                    obj.get("url"),
+                )
 
             for v in obj.values():
                 walk(v)
@@ -852,7 +945,9 @@ def _build_apple_playlist_result(
     return {"playlist": playlist, "items": items, "meta": meta}
 
 
-def _parse_apple_html_payload(html: str, url: str, strategy_hint: str = "html", meta_extra: dict | None = None) -> Optional[Dict[str, Any]]:
+def _parse_apple_html_payload(
+    html: str, url: str, strategy_hint: str = "html", meta_extra: dict | None = None
+) -> Optional[Dict[str, Any]]:
     """Parse Apple Music HTML for embedded JSON and build playlist result."""
     soup = BeautifulSoup(html, "html.parser")
 
@@ -861,7 +956,11 @@ def _parse_apple_html_payload(html: str, url: str, strategy_hint: str = "html", 
     for script in soup.find_all("script"):
         script_id = script.get("id", "")
         script_type = (script.get("type") or "").lower()
-        if script_id == "__NEXT_DATA__" or script_type == "application/json" or script_type == "application/ld+json":
+        if (
+            script_id == "__NEXT_DATA__"
+            or script_type == "application/json"
+            or script_type == "application/ld+json"
+        ):
             text = script.string or script.get_text() or ""
             if text.strip():
                 candidate_scripts.append(text)
@@ -917,7 +1016,7 @@ async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
     Returns playlist dict on success, or None to signal HTTP-only (no removed_browser).
     """
     if url:
-        url = url.strip().strip('"\'')
+        url = url.strip().strip("\"'")
         if url.startswith("<") and url.endswith(">"):
             url = url[1:-1].strip()
 
@@ -949,21 +1048,30 @@ async def fetch_apple_playlist_http_first(url: str) -> Optional[Dict[str, Any]]:
                 break
             except Exception as e:
                 last_error = e
-                logger.warning(f"[Apple HTML] attempt {attempt + 1}/{APPLE_HTTP_RETRIES + 1} failed: {e}")
+                logger.warning(
+                    f"[Apple HTML] attempt {attempt + 1}/{APPLE_HTTP_RETRIES + 1} failed: {e}"
+                )
                 await asyncio.sleep(1.0 * (attempt + 1))
 
     if not html:
-        logger.warning(f"[Apple HTML] Failed to fetch HTML; HTTP-only (no removed_browser). last_error={last_error}")
+        logger.warning(
+            f"[Apple HTML] Failed to fetch HTML; HTTP-only (no removed_browser). last_error={last_error}"
+        )
         return None
 
     parsed = _parse_apple_html_payload(
         html,
         final_url or url,
         strategy_hint="html",
-        meta_extra={"apple_http_status": status_code, "apple_final_url": final_url or url},
+        meta_extra={
+            "apple_http_status": status_code,
+            "apple_final_url": final_url or url,
+        },
     )
     if parsed:
-        logger.info(f"[Apple HTML] Parsed {len(parsed.get('items', []))} tracks from embedded JSON")
+        logger.info(
+            f"[Apple HTML] Parsed {len(parsed.get('items', []))} tracks from embedded JSON"
+        )
     return parsed
 
 
@@ -980,22 +1088,21 @@ async def fetch_playlist_tracks_generic(
     Returns dict with 'perf' key containing timing metrics.
     """
     import time
+
     t0_total = time.time()
-    
+
     src = (source or "spotify").lower()
     perf = {
-        'fetch_ms': 0,
-        'enrich_ms': 0,
-        'total_ms': 0,
-        'tracks_count': 0,
+        "fetch_ms": 0,
+        "enrich_ms": 0,
+        "total_ms": 0,
+        "tracks_count": 0,
     }
-    
+
     if src == "apple":
         t0_fetch = time.time()
         apple_strategy = "html"
         result: Dict[str, Any] | None = None
-        mode = (apple_mode or "auto").lower()
-
         # HTTP-first attempt
         try:
             result = await asyncio.wait_for(
@@ -1005,9 +1112,11 @@ async def fetch_playlist_tracks_generic(
         except Exception as e:
             logger.info(f"[Apple] HTML-first failed (HTTP-only): {e}")
         if not result:
-            raise RuntimeError("Apple Music fetch failed (HTTP-only). Try again later or use Spotify source.")
+            raise RuntimeError(
+                "Apple Music fetch failed (HTTP-only). Try again later or use Spotify source."
+            )
         t1_fetch = time.time()
-        perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
+        perf["fetch_ms"] = (t1_fetch - t0_fetch) * 1000
 
         # Determine enrichment default: if not specified, default False for Apple
         do_enrich = bool(enrich_spotify) if enrich_spotify is not None else False
@@ -1018,26 +1127,26 @@ async def fetch_playlist_tracks_generic(
             t0_enrich = time.time()
             result = _enrich_apple_tracks_with_spotify(result)
             t1_enrich = time.time()
-            perf['enrich_ms'] = (t1_enrich - t0_enrich) * 1000
+            perf["enrich_ms"] = (t1_enrich - t0_enrich) * 1000
         else:
             # Skip Spotify enrichment deliberately
             meta["apple_enrich_skipped"] = True
-            perf['enrich_ms'] = 0.0
+            perf["enrich_ms"] = 0.0
         result["meta"] = meta
 
-        result['perf'] = perf
+        result["perf"] = perf
         t1_total = time.time()
-        perf['total_ms'] = (t1_total - t0_total) * 1000
-        perf['tracks_count'] = len(result.get('items', []))
+        perf["total_ms"] = (t1_total - t0_total) * 1000
+        perf["tracks_count"] = len(result.get("items", []))
         return result
     else:
         t0_fetch = time.time()
         result = await asyncio.to_thread(fetch_playlist_tracks, url_or_id)
         t1_fetch = time.time()
-        perf['fetch_ms'] = (t1_fetch - t0_fetch) * 1000
-        
-        result['perf'] = perf
+        perf["fetch_ms"] = (t1_fetch - t0_fetch) * 1000
+
+        result["perf"] = perf
         t1_total = time.time()
-        perf['total_ms'] = (t1_total - t0_total) * 1000
-        perf['tracks_count'] = len(result.get('items', []))
+        perf["total_ms"] = (t1_total - t0_total) * 1000
+        perf["tracks_count"] = len(result.get("items", []))
         return result

@@ -1,5 +1,9 @@
 import unittest
-from lib.rekordbox.normalizer import normalize_artist, normalize_title_base, normalize_album
+from lib.rekordbox.normalizer import (
+    normalize_artist,
+    normalize_title_base,
+    normalize_album,
+)
 
 
 class NormalizeTests(unittest.TestCase):
