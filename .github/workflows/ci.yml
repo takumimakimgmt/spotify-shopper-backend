@@ -44,7 +44,7 @@ jobs:
         env:
           # dummy only
           SPOTIFY_CLIENT_ID: "dummy"
-          SPOTIFY_CLIENT_CRED_DUMMY: "dummy"
+          SPOTIFY_CLIENT_SECRET: "dummy"  # pragma: allowlist secret
           ALLOWED_ORIGINS: "https://example.invalid"
           CORS_ALLOW_CREDENTIALS: "true"
         run: |
