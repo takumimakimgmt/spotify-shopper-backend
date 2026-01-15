@@ -30,3 +30,27 @@ venv/
 .cache
 
 *.bak
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# dotenv (never commit)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Project-specific noise
+_context/

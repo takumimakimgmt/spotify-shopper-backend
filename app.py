@@ -5,12 +5,13 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-_ENV = Path(__file__).resolve().parent / '.env'
-_ENV_LOCAL = Path(__file__).resolve().parent / '.env.local'
+_ENV = Path(__file__).resolve().parent / ".env"
+_ENV_LOCAL = Path(__file__).resolve().parent / ".env.local"
 if _ENV.exists():
     load_dotenv(dotenv_path=_ENV, override=True)
 if _ENV_LOCAL.exists():
     load_dotenv(dotenv_path=_ENV_LOCAL, override=True)
+
 
 # Upload size limit (bytes). Used by /api/playlist-with-rekordbox-upload.
 def _env_int(name: str, default: int) -> int:
@@ -20,12 +21,11 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 MAX_UPLOAD_SIZE = _env_int("MAX_UPLOAD_SIZE", 10 * 1024 * 1024)  # default 10MB
 
 import inspect
 from contextlib import asynccontextmanager
-
-import os
 
 
 def _sanitize_for_json(obj):
@@ -89,7 +89,6 @@ def _sanitize_for_json(obj):
 
 
 import tempfile
-import asyncio
 from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import (
@@ -118,6 +117,7 @@ from core import _CACHE_VERSION as CACHE_VERSION
 from lib.rekordbox import mark_owned_tracks
 import logging
 import json
+
 # Basic logging configuration to ensure logger outputs appear in the terminal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
@@ -127,6 +127,7 @@ logger.setLevel(logging.INFO)
 # =========================
 # Pydantic models
 # =========================
+
 
 class StoreLinksModel(BaseModel):
     beatport: Optional[str] = None
@@ -144,15 +145,21 @@ class TrackModel(BaseModel):
     links: Optional[StoreLinksModel] = None
     owned: Optional[bool] = None
     owned_reason: Optional[str] = None
-    track_key_primary: Optional[str] = None  # ISRC-based or fallback (server-determined for state sync)
+    track_key_primary: Optional[str] = (
+        None  # ISRC-based or fallback (server-determined for state sync)
+    )
     track_key_fallback: Optional[str] = None  # normalized(title+artist+album) backup
-    track_key_primary_type: Literal["isrc", "norm"] = "norm"  # "isrc" | "norm" (UI hint: isrc=confident, norm=ambiguous)
-    track_key_version: str = "v1"  # version for future-proof migrations (normalize rules evolution)
+    track_key_primary_type: Literal["isrc", "norm"] = (
+        "norm"  # "isrc" | "norm" (UI hint: isrc=confident, norm=ambiguous)
+    )
+    track_key_version: str = (
+        "v1"  # version for future-proof migrations (normalize rules evolution)
+    )
 
 
 class PlaylistMetaModel(BaseModel):
     model_config = {"extra": "allow"}  # Allow unknown fields to pass through
-    
+
     cache_hit: Optional[bool] = None
     cache_ttl_s: Optional[int] = None
     refresh: bool = False
@@ -197,6 +204,7 @@ class PlaylistWithRekordboxBody(BaseModel):
 # FastAPI app & CORS
 # =========================
 
+
 # cc:lifespan-migrated
 @asynccontextmanager
 async def lifespan(app):
@@ -206,7 +214,7 @@ async def lifespan(app):
             await res
 
     # startup
-    for fn in (_log_startup, ):
+    for fn in (_log_startup,):
         await _maybe_await(fn)
 
     yield
@@ -216,23 +224,60 @@ async def lifespan(app):
         await _maybe_await(fn)
 
 
-app = FastAPI(
-    title="Spotify Playlist Shopper",
-    version="1.0.0", lifespan=lifespan)
+def _parse_bool(v: str | None, default: bool = False) -> bool:
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_origins(v: str | None) -> list[str]:
+    if not v:
+        return []
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+
+def _load_cors_config() -> tuple[list[str], bool, str]:
+    """
+    Env contract:
+      - APP_ENV: production|staging|local
+      - ALLOWED_ORIGINS: comma-separated exact origins
+      - CORS_ALLOW_CREDENTIALS: true|false
+
+    Safety:
+      - credentials=true => explicit non-empty origins only; wildcard forbidden; regex not supported.
+      - local may fallback to localhost defaults if ALLOWED_ORIGINS unset.
+    """
+    app_env = (os.getenv("APP_ENV", "local") or "local").strip().lower()
+    allow_credentials = _parse_bool(os.getenv("CORS_ALLOW_CREDENTIALS"), default=True)
+    origins = _parse_origins(os.getenv("ALLOWED_ORIGINS"))
+
+    if not origins and app_env == "local":
+        origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+    if allow_credentials:
+        if not origins:
+            raise RuntimeError(
+                "CORS misconfig: credentials=true requires ALLOWED_ORIGINS (exact list)."
+            )
+        if any(o == "*" for o in origins):
+            raise RuntimeError(
+                "CORS misconfig: wildcard origin is forbidden when credentials=true."
+            )
+
+    return origins, allow_credentials, app_env
+
+
+app = FastAPI(title="Spotify Playlist Shopper", version="1.0.0", lifespan=lifespan)
 
 
 # CORS: allow Vercel preview/prod + local dev
+# CORS: exact origins only (env contract); no broad regex
+_ALLOWED_ORIGINS, _CORS_ALLOW_CREDENTIALS, _APP_ENV = _load_cors_config()
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https://.*\.vercel\.app$",
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://playlist-shopper.vercel.app",
-    ],
-    
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_ALLOWED_ORIGINS,  # exact match list only
+    allow_credentials=_CORS_ALLOW_CREDENTIALS,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -243,7 +288,10 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # Allow slightly larger than XML limit to account for multipart overhead (fields + boundaries)
-REQUEST_SIZE_LIMIT_BYTES = int(os.getenv("REQUEST_SIZE_LIMIT_BYTES", str(70 * 1024 * 1024)))
+REQUEST_SIZE_LIMIT_BYTES = int(
+    os.getenv("REQUEST_SIZE_LIMIT_BYTES", str(70 * 1024 * 1024))
+)
+
 
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -256,11 +304,13 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
                 max_mb = REQUEST_SIZE_LIMIT_BYTES / (1024 * 1024)
                 return JSONResponse(
                     status_code=413,
-                    content={"detail": f"Request body too large (max {max_mb:.0f}MB)"}
+                    content={"detail": f"Request body too large (max {max_mb:.0f}MB)"},
                 )
         return await call_next(request)
 
+
 app.add_middleware(RequestSizeLimitMiddleware)
+
 
 def _log_startup():
     logger.info("spotify-shopper: startup event triggered")
@@ -268,6 +318,7 @@ def _log_startup():
 
 def health() -> Dict[str, Any]:
     import os
+
     return {
         "ok": True,
         "status": "ok",
@@ -286,6 +337,7 @@ def root() -> Dict[str, Any]:
 # Core helpers
 # =========================
 
+
 def _sanitize_url(raw: str) -> str:
     """
     Basic server-side URL sanitization: trim whitespace, strip surrounding
@@ -294,10 +346,10 @@ def _sanitize_url(raw: str) -> str:
     if not raw:
         return raw
     s = raw.strip()
-    if s.startswith('<') and s.endswith('>'):
+    if s.startswith("<") and s.endswith(">"):
         s = s[1:-1].strip()
     # strip surrounding quotes
-    s = s.strip('\'"')
+    s = s.strip("'\"")
     return s
 
 
@@ -320,6 +372,7 @@ def _apply_rekordbox_owned_flags(
 # Endpoints
 # =========================
 
+
 @app.get("/api/playlist", response_model=PlaylistResponse)
 async def get_playlist(
     request: Request,
@@ -327,23 +380,29 @@ async def get_playlist(
     source: str = Query("spotify", description="spotify or apple"),
     apple_mode: str = Query("auto", description="auto|fast|legacy (Apple only)"),
     enrich_isrc: bool = Query(False, description="Fill missing ISRCs via MusicBrainz"),
-    isrc_limit: Optional[int] = Query(None, description="Max items to try enriching ISRC"),
-    enrich_spotify: Optional[int] = Query(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
-    refresh: bool = False
+    isrc_limit: Optional[int] = Query(
+        None, description="Max items to try enriching ISRC"
+    ),
+    enrich_spotify: Optional[int] = Query(
+        None,
+        description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)",
+    ),
+    refresh: bool = False,
 ):
     # Apple Music is deferred: do not accept Apple URLs/requests for now
-    if source == 'apple' or 'music.apple.com' in url or 'itunes.apple.com' in url:
+    if source == "apple" or "music.apple.com" in url or "itunes.apple.com" in url:
         raise HTTPException(
             status_code=400,
-            detail='Apple Music is temporarily disabled (deferred).',
+            detail="Apple Music is temporarily disabled (deferred).",
         )
 
     """
     プレイリストだけを取得（Rekordbox 突き合わせなし）。
     """
     import time
+
     t0_total = time.time()
-    
+
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
     clean_url = _sanitize_url(url)
     normalized_url = normalize_playlist_url(clean_url)
@@ -355,7 +414,9 @@ async def get_playlist(
     if src != "apple":
         mode = "auto"  # Only meaningful for Apple
 
-    logger.info(f"[api/playlist] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}")
+    logger.info(
+        f"[api/playlist] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}"
+    )
 
     # Call core directly so we can attach debug info on failure
     try:
@@ -372,9 +433,9 @@ async def get_playlist(
         cache_key = f"{CACHE_VERSION}:{src}:{normalized_url}"
         if src == "apple":
             cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
-        bypass = (refresh == 1)
+        bypass = refresh == 1
         cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
-        cache_hit = (cached is not None)
+        cache_hit = cached is not None
         if cached is not None:
             result = cached
         else:
@@ -383,9 +444,13 @@ async def get_playlist(
                 clean_url,
                 app=request.app,
                 apple_mode=mode if src == "apple" else None,
-                enrich_spotify=(bool(effective_enrich_spotify) if effective_enrich_spotify is not None else None),
+                enrich_spotify=(
+                    bool(effective_enrich_spotify)
+                    if effective_enrich_spotify is not None
+                    else None
+                ),
             )
-        
+
         # Optional ISRC enrichment (best-effort)
         if enrich_isrc and isinstance(result, dict):
             try:
@@ -397,17 +462,22 @@ async def get_playlist(
             except Exception as _:
                 # ignore enrichment errors
                 pass
-        
+
         data = playlist_result_to_dict(result)
         perf = result.get("perf", {}) if isinstance(result, dict) else {}
-        
+
         # Log performance metrics
         t1_total = time.time()
         total_ms = (t1_total - t0_total) * 1000
-        tracks_count = len(data.get('tracks', []))
+        tracks_count = len(data.get("tracks", []))
         # Cache store (only successful non-empty)
         try:
-            if not bypass and not cache_hit and not result.get("error") and len(data.get("tracks", [])) > 0:
+            if (
+                not bypass
+                and not cache_hit
+                and not result.get("error")
+                and len(data.get("tracks", [])) > 0
+            ):
                 PLAYLIST_CACHE[cache_key] = result
         except Exception:
             pass
@@ -446,18 +516,28 @@ async def get_playlist(
             try:
                 error_meta = {
                     "apple_strategy": "html",
-                    "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
+                    "apple_enrich_skipped": True
+                    if (
+                        effective_enrich_spotify is None
+                        or int(effective_enrich_spotify) == 0
+                    )
+                    else False,
                 }
             except Exception:
                 pass
-        logger.error(f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}")
+        logger.error(
+            f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}"
+        )
         # Return structured detail including meta to aid client-side separation
-        raise HTTPException(status_code=400, detail={
-            "error": str(e),
-            "used_source": src,
-            "url": clean_url,
-            "meta": error_meta,
-        })
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": str(e),
+                "used_source": src,
+                "url": clean_url,
+                "meta": error_meta,
+            },
+        )
 
 
 @app.post("/api/playlist-with-rekordbox", response_model=PlaylistResponse)
@@ -470,11 +550,13 @@ async def playlist_with_rekordbox(body: PlaylistWithRekordboxBody, request: Requ
     }
     """
     try:
-        result = await fetch_playlist_tracks_generic(getattr(body, "source", "spotify"), body.url, app=request.app)
+        result = await fetch_playlist_tracks_generic(
+            getattr(body, "source", "spotify"), body.url, app=request.app
+        )
         playlist_data = playlist_result_to_dict(result)
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": str(e)})
-    
+
     playlist_with_owned = _apply_rekordbox_owned_flags(
         playlist_data,
         body.rekordbox_xml_path,
@@ -499,29 +581,46 @@ async def match_snapshot_with_xml(
     if snapshot is None:
         raise HTTPException(status_code=400, detail="snapshot は必須です")
     if len(snapshot.encode("utf-8")) > 1 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="snapshot のサイズが上限(1MB)を超えています")
+        raise HTTPException(
+            status_code=413, detail="snapshot のサイズが上限(1MB)を超えています"
+        )
 
     # JSON パース
     try:
         snap = json.loads(snapshot)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"snapshot JSON のパースに失敗: {e}")
+        raise HTTPException(
+            status_code=400, detail=f"snapshot JSON のパースに失敗: {e}"
+        )
 
     # 簡易スキーマ検証
     if not isinstance(snap, dict):
-        raise HTTPException(status_code=400, detail="snapshot は JSON オブジェクトである必要があります")
+        raise HTTPException(
+            status_code=400, detail="snapshot は JSON オブジェクトである必要があります"
+        )
     if snap.get("schema") != "playlist_snapshot":
-        raise HTTPException(status_code=400, detail="snapshot.schema は 'playlist_snapshot' である必要があります")
+        raise HTTPException(
+            status_code=400,
+            detail="snapshot.schema は 'playlist_snapshot' である必要があります",
+        )
     if snap.get("version") != 1:
-        raise HTTPException(status_code=400, detail="snapshot.version は 1 である必要があります")
+        raise HTTPException(
+            status_code=400, detail="snapshot.version は 1 である必要があります"
+        )
     if "tracks" not in snap or not isinstance(snap["tracks"], list):
-        raise HTTPException(status_code=400, detail="snapshot.tracks は配列である必要があります")
+        raise HTTPException(
+            status_code=400, detail="snapshot.tracks は配列である必要があります"
+        )
 
     # XML ファイル必須＆検証
     if file is None:
-        raise HTTPException(status_code=400, detail="XML ファイルを 'file' フィールドで送信してください")
+        raise HTTPException(
+            status_code=400, detail="XML ファイルを 'file' フィールドで送信してください"
+        )
     if file.content_type not in ("text/xml", "application/xml", "text/plain"):
-        raise HTTPException(status_code=400, detail="XML ファイルをアップロードしてください")
+        raise HTTPException(
+            status_code=400, detail="XML ファイルをアップロードしてください"
+        )
 
     try:
         xml_bytes = await file.read()
@@ -531,7 +630,10 @@ async def match_snapshot_with_xml(
     if not xml_bytes:
         raise HTTPException(status_code=400, detail="空の XML ファイルです")
     if len(xml_bytes) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"XML が大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）")
+        raise HTTPException(
+            status_code=413,
+            detail=f"XML が大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）",
+        )
 
     # 既存の mark_owned_tracks は playlist 型（/api/playlist の返却）を期待するため、
     # snapshot から近い構造に組み替えて owned 判定を実行し、結果を snapshot に反映する。
@@ -596,6 +698,7 @@ async def match_snapshot_with_xml(
     # 返却：PlaylistSnapshotV1（入力を更新したもの）
     return snap
 
+
 @app.post("/api/playlist-with-rekordbox-upload", response_model=PlaylistResponse)
 async def playlist_with_rekordbox_upload(
     request: Request,
@@ -603,7 +706,10 @@ async def playlist_with_rekordbox_upload(
     source: str = Form("spotify", description="spotify or apple"),
     apple_mode: str = Form("auto", description="auto|fast|legacy (Apple only)"),
     file: UploadFile | None = File(None, description="Rekordbox collection XML"),
-    enrich_spotify: Optional[int] = Form(None, description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)"),
+    enrich_spotify: Optional[int] = Form(
+        None,
+        description="For Apple: 1 to enrich via Spotify, 0 to skip (default 0 for apple)",
+    ),
     refresh: Optional[int] = Form(None, description="Bypass cache when set to 1"),
 ):
     """
@@ -612,8 +718,9 @@ async def playlist_with_rekordbox_upload(
     - アップロードされた XML を一時ファイルに保存し、Rekordbox 突き合わせ。
     """
     import time
+
     t0_total = time.time()
-    
+
     # file は任意。ある場合は後で content-type とサイズ検証を行う。
 
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
@@ -627,7 +734,9 @@ async def playlist_with_rekordbox_upload(
     if src != "apple":
         mode = "auto"  # Only meaningful for Apple
 
-    logger.info(f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}")
+    logger.info(
+        f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}"
+    )
 
     try:
         t0_fetch = time.time()
@@ -641,7 +750,7 @@ async def playlist_with_rekordbox_upload(
         cache_key = f"{CACHE_VERSION}:{src}:{normalized_url}"
         if src == "apple":
             cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
-        bypass = (refresh == 1)
+        bypass = refresh == 1
         cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
         cache_hit = cached is not None
         if cached is not None:
@@ -652,16 +761,25 @@ async def playlist_with_rekordbox_upload(
                 clean_url,
                 app=request.app,
                 apple_mode=mode if src == "apple" else None,
-                enrich_spotify=(bool(effective_enrich_spotify) if effective_enrich_spotify is not None else None),
+                enrich_spotify=(
+                    bool(effective_enrich_spotify)
+                    if effective_enrich_spotify is not None
+                    else None
+                ),
             )
         t1_fetch = time.time()
         fetch_ms = (t1_fetch - t0_fetch) * 1000
-        
+
         playlist_data = playlist_result_to_dict(result)
 
         # Store base playlist in cache (no XML-specific flags)
         try:
-            if not bypass and not cache_hit and not result.get("error") and len(playlist_data.get("tracks", [])) > 0:
+            if (
+                not bypass
+                and not cache_hit
+                and not result.get("error")
+                and len(playlist_data.get("tracks", [])) > 0
+            ):
                 PLAYLIST_CACHE[cache_key] = result
         except Exception:
             pass
@@ -671,17 +789,27 @@ async def playlist_with_rekordbox_upload(
             try:
                 error_meta = {
                     "apple_strategy": "html",
-                    "apple_enrich_skipped": True if (effective_enrich_spotify is None or int(effective_enrich_spotify) == 0) else False,
+                    "apple_enrich_skipped": True
+                    if (
+                        effective_enrich_spotify is None
+                        or int(effective_enrich_spotify) == 0
+                    )
+                    else False,
                 }
             except Exception:
                 pass
-        logger.error(f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}")
-        raise HTTPException(status_code=400, detail={
-            "error": str(e),
-            "used_source": src,
-            "url": clean_url,
-            "meta": error_meta,
-        })
+        logger.error(
+            f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": str(e),
+                "used_source": src,
+                "url": clean_url,
+                "meta": error_meta,
+            },
+        )
 
     # 一時ファイルに XML を書き出し
     playlist_with_owned = playlist_data
@@ -691,18 +819,25 @@ async def playlist_with_rekordbox_upload(
     # file がある場合だけ Rekordbox 照合を行う
     if file is not None:
         if file.content_type not in ("text/xml", "application/xml", "text/plain"):
-            raise HTTPException(status_code=400, detail="XML ファイルをアップロードしてください。")
+            raise HTTPException(
+                status_code=400, detail="XML ファイルをアップロードしてください。"
+            )
 
         try:
             contents = await file.read()
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"ファイル読み込みに失敗しました: {e}")
+            raise HTTPException(
+                status_code=400, detail=f"ファイル読み込みに失敗しました: {e}"
+            )
 
         if not contents:
             raise HTTPException(status_code=400, detail="空のファイルです。")
 
         if len(contents) > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=400, detail=f"ファイルが大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）。")
+            raise HTTPException(
+                status_code=400,
+                detail=f"ファイルが大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）。",
+            )
 
         tmp_path = None
         try:
@@ -727,26 +862,22 @@ async def playlist_with_rekordbox_upload(
 
     t1_total = time.time()
     total_ms = (t1_total - t0_total) * 1000
-    tracks_count = len(playlist_with_owned.get('tracks', []))
+    tracks_count = len(playlist_with_owned.get("tracks", []))
     logger.info(
         f"[PERF] source={src} url_len={len(clean_url)} normalized_url_len={len(normalized_url)} "
         f"cache_hit={'true' if 'cache_hit' in locals() and cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} cache_size={len(PLAYLIST_CACHE)} refresh={'1' if (refresh == 1) else '0'} "
         f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} tracks={tracks_count}"
     )
     return JSONResponse(content=_sanitize_for_json(playlist_with_owned))
+
+
 # =========================
 # Local dev entrypoint
 # =========================
 
 
-from typing import Dict
-
 @app.get("/api/health", include_in_schema=False)
 def api_health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-@app.get("/health", include_in_schema=False)
-def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 

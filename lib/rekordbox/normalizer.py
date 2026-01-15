@@ -1,6 +1,7 @@
 """
 正規化ヘルパー: タイトル/アーティスト/アルバム名のゆらぎを減らす。
 """
+
 from __future__ import annotations
 
 import re
