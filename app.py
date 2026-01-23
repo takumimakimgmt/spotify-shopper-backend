@@ -116,6 +116,7 @@ from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
 from core import _CACHE_VERSION as CACHE_VERSION
 from lib.rekordbox import mark_owned_tracks
 import logging
+import re
 import json
 
 # Basic logging configuration to ensure logger outputs appear in the terminal
@@ -230,13 +231,25 @@ def _parse_bool(v: str | None, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _normalize_origin(origin: str) -> str:
+    """Normalize origins for exact-match CORS.
+    Browser Origin header never includes trailing slash.
+    """
+    return origin.strip().rstrip("/")
+
+
 def _parse_origins(v: str | None) -> list[str]:
     if not v:
         return []
-    return [x.strip() for x in v.split(",") if x.strip()]
+    out: list[str] = []
+    for raw in v.split(","):
+        o = _normalize_origin(raw)
+        if o:
+            out.append(o)
+    return out
 
 
-def _load_cors_config() -> tuple[list[str], bool, str]:
+def _load_cors_config() -> tuple[list[str], bool, str, str | None]:
     """
     Env contract:
       - APP_ENV: production|staging|local
@@ -250,21 +263,24 @@ def _load_cors_config() -> tuple[list[str], bool, str]:
     app_env = (os.getenv("APP_ENV", "local") or "local").strip().lower()
     allow_credentials = _parse_bool(os.getenv("CORS_ALLOW_CREDENTIALS"), default=True)
     origins = _parse_origins(os.getenv("ALLOWED_ORIGINS"))
+    origin_regex = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
 
     if not origins and app_env == "local":
         origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
     if allow_credentials:
-        if not origins:
+        if not origins and not origin_regex:
             raise RuntimeError(
-                "CORS misconfig: credentials=true requires ALLOWED_ORIGINS (exact list)."
+                "CORS misconfig: credentials=true requires ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX."
             )
         if any(o == "*" for o in origins):
             raise RuntimeError(
                 "CORS misconfig: wildcard origin is forbidden when credentials=true."
             )
+        if origin_regex:
+            re.compile(origin_regex)
 
-    return origins, allow_credentials, app_env
+    return origins, allow_credentials, app_env, origin_regex
 
 
 app = FastAPI(title="Spotify Playlist Shopper", version="1.0.0", lifespan=lifespan)
@@ -272,10 +288,20 @@ app = FastAPI(title="Spotify Playlist Shopper", version="1.0.0", lifespan=lifesp
 
 # CORS: allow Vercel preview/prod + local dev
 # CORS: exact origins only (env contract); no broad regex
-_ALLOWED_ORIGINS, _CORS_ALLOW_CREDENTIALS, _APP_ENV = _load_cors_config()
+_ALLOWED_ORIGINS, _CORS_ALLOW_CREDENTIALS, _APP_ENV, _ALLOWED_ORIGIN_REGEX = (
+    _load_cors_config()
+)
+logger.info(
+    "CORS config: env=%s allow_credentials=%s origins=%s origin_regex=%s",
+    _APP_ENV,
+    _CORS_ALLOW_CREDENTIALS,
+    _ALLOWED_ORIGINS,
+    _ALLOWED_ORIGIN_REGEX,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,  # exact match list only
+    allow_origin_regex=_ALLOWED_ORIGIN_REGEX,
     allow_credentials=_CORS_ALLOW_CREDENTIALS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
