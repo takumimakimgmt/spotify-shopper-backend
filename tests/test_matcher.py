@@ -10,6 +10,8 @@ def _write_xml(tmp_path: Path) -> Path:
   <COLLECTION>
     <TRACK Name="Song A" Artist="Artist A" Album="Album A" ISRC="ISRC123" />
     <TRACK Name="Bright Lights" Artist="Artist B" Album="Album B" />
+    <TRACK Name="Goodums_-_Sammy_Virji_Remix" Artist="Sammy Virji" Album="Album C" />
+    <TRACK Name="Shapes_(Oh_Will)_-_Oppidan_Remix" Artist="Oppidan" Album="Album D" />
   </COLLECTION>
 </DJ_PLAYLISTS>
 """
@@ -56,6 +58,33 @@ class MatcherTests(unittest.TestCase):
         track = result["tracks"][0]
         self.assertTrue(track["owned"])
         self.assertEqual(track["owned_reason"], "fuzzy")
+
+    def test_mark_owned_matches_titles_with_underscore_separators(self):
+        tmp_dir = Path(self._get_tmp_dir())
+        xml_path = _write_xml(tmp_dir)
+        playlist = {
+            "tracks": [
+                {
+                    "title": "Goodums - Sammy Virji Remix",
+                    "artist": "Sammy Virji",
+                    "album": "Album C",
+                    "isrc": None,
+                },
+                {
+                    "title": "Shapes (Oh Will) - Oppidan Remix",
+                    "artist": "Oppidan",
+                    "album": "Album D",
+                    "isrc": None,
+                },
+            ]
+        }
+
+        result = mark_owned_tracks(playlist, xml_path)
+
+        self.assertTrue(result["tracks"][0]["owned"])
+        self.assertEqual(result["tracks"][0]["owned_reason"], "exact")
+        self.assertTrue(result["tracks"][1]["owned"])
+        self.assertEqual(result["tracks"][1]["owned_reason"], "exact")
 
     def _get_tmp_dir(self) -> str:
         # unittest doesn't provide tmp_path fixture; use mkdtemp
