@@ -97,6 +97,22 @@ from spotipy.exceptions import SpotifyException
 # Configure logger for this module
 logger = logging.getLogger(__name__)
 
+SPOTIFY_AUDIO_FEATURES_BATCH_SIZE = 100
+SPOTIFY_KEY_LABELS = {
+    0: "C",
+    1: "C#/Db",
+    2: "D",
+    3: "D#/Eb",
+    4: "E",
+    5: "F",
+    6: "F#/Gb",
+    7: "G",
+    8: "G#/Ab",
+    9: "A",
+    10: "A#/Bb",
+    11: "B",
+}
+
 
 class AppleFetchError(Exception):
     """Custom error to carry Apple-specific meta for diagnostics."""
@@ -330,6 +346,80 @@ def build_store_links(
     }
 
 
+def format_spotify_key(key: int | None, mode: int | None) -> str | None:
+    """Convert Spotify audio-features key/mode to a DJ-friendly display string."""
+    if key is None or mode is None:
+        return None
+    if key not in SPOTIFY_KEY_LABELS or mode not in (0, 1):
+        return None
+
+    label = SPOTIFY_KEY_LABELS[key]
+    if mode == 1:
+        return label
+
+    if "/" in label:
+        return "/".join(f"{part}m" for part in label.split("/"))
+    return f"{label}m"
+
+
+def _chunked(values: List[str], size: int) -> List[List[str]]:
+    return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def _build_audio_features_map(
+    sp: spotipy.Spotify,
+    track_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch Spotify audio features in batches and index by track ID."""
+    features_by_id: Dict[str, Dict[str, Any]] = {}
+
+    for batch in _chunked(track_ids, SPOTIFY_AUDIO_FEATURES_BATCH_SIZE):
+        features = sp.audio_features(batch) or []
+        for feature in features:
+            if not feature:
+                continue
+            track_id = feature.get("id")
+            if isinstance(track_id, str) and track_id:
+                features_by_id[track_id] = feature
+
+    return features_by_id
+
+
+def _enrich_items_with_audio_features(
+    sp: spotipy.Spotify,
+    items: List[Dict[str, Any]],
+) -> None:
+    """Best-effort audio-features enrichment for Spotify playlist items."""
+    track_ids: List[str] = []
+    seen: set[str] = set()
+
+    for item in items:
+        track = item.get("track") or {}
+        track_id = track.get("id")
+        if isinstance(track_id, str) and track_id and track_id not in seen:
+            seen.add(track_id)
+            track_ids.append(track_id)
+
+    if not track_ids:
+        return
+
+    try:
+        features_by_id = _build_audio_features_map(sp, track_ids)
+    except Exception as exc:
+        logger.warning("[Spotify] audio features enrichment failed: %s", exc)
+        return
+
+    for item in items:
+        track = item.get("track") or {}
+        track_id = track.get("id")
+        if not isinstance(track_id, str) or not track_id:
+            continue
+        feature = features_by_id.get(track_id)
+        if feature:
+            track["audio_features"] = feature
+            item["track"] = track
+
+
 # =========================
 # プレイリスト取得
 # =========================
@@ -521,6 +611,8 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
         )
         raise RuntimeError(prefix + hint)
 
+    _enrich_items_with_audio_features(sp, items)
+
     return {
         "playlist": playlist,
         "items": items,
@@ -652,6 +744,11 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         spotify_url = track.get("external_urls", {}).get("spotify", "")
         apple_url = track.get("external_urls", {}).get("apple", "")
         isrc = (track.get("external_ids") or {}).get("isrc")  # ISRC from Spotify
+        audio_features = track.get("audio_features") or {}
+        spotify_key = audio_features.get("key")
+        spotify_mode = audio_features.get("mode")
+        tempo = audio_features.get("tempo")
+        bpm = round(tempo) if isinstance(tempo, (int, float)) else None
 
         links = build_store_links(title, artist_name, album_name, isrc=isrc)
 
@@ -678,6 +775,13 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "spotify_url": spotify_url,
                 "apple_url": apple_url,
                 "links": links,
+                "bpm": bpm,
+                "key": format_spotify_key(spotify_key, spotify_mode),
+                "tempo": tempo if isinstance(tempo, (int, float)) else None,
+                "spotifyKey": spotify_key if isinstance(spotify_key, int) else None,
+                "spotifyMode": (
+                    spotify_mode if isinstance(spotify_mode, int) else None
+                ),
                 "track_key_primary": final_primary,
                 "track_key_fallback": track_key_fallback,
                 "track_key_primary_type": track_key_primary_type,  # UI hint: "isrc" → confident, "norm" → ambiguous

@@ -144,6 +144,11 @@ class TrackModel(BaseModel):
     spotify_url: Optional[str] = None
     apple_url: Optional[str] = None
     links: Optional[StoreLinksModel] = None
+    bpm: Optional[int] = None
+    key: Optional[str] = None
+    tempo: Optional[float] = None
+    spotifyKey: Optional[int] = None
+    spotifyMode: Optional[int] = None
     owned: Optional[bool] = None
     owned_reason: Optional[str] = None
     track_key_primary: Optional[str] = (
