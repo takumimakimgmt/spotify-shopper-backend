@@ -37,6 +37,7 @@ def normalize_title_base(title: str) -> str:
     """
     タイトルの基本正規化:
     - 小文字化
+    - アンダースコア区切りをスペースとして扱う
     - () / [] 内の表記を削る (MIX名やレーベルなど)
     - feat. / ft. / featuring 以降を削る
     - 末尾の " - original mix" 系を削る
@@ -44,6 +45,7 @@ def normalize_title_base(title: str) -> str:
     - 区切り文字 | をエスケープ（track_key_fallback用）
     """
     s = (title or "").lower().strip()
+    s = s.replace("_", " ")
 
     # 括弧の中身を全部落とす（位置に関係なく）
     s = re.sub(r"\([^)]*\)", "", s)

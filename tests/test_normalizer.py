@@ -14,6 +14,14 @@ class NormalizeTests(unittest.TestCase):
     def test_normalize_title_base_removes_parens_and_mix(self):
         self.assertEqual(normalize_title_base("My Song (Original Mix)"), "my song")
         self.assertEqual(normalize_title_base("Track [Deluxe] - Radio Edit"), "track")
+        self.assertEqual(
+            normalize_title_base("Goodums_-_Sammy_Virji_Remix"),
+            "goodums - sammy virji remix",
+        )
+        self.assertEqual(
+            normalize_title_base("Shapes_(Oh_Will)_-_Oppidan_Remix"),
+            "shapes - oppidan remix",
+        )
 
     def test_normalize_album_simplifies_spacing(self):
         self.assertEqual(normalize_album("Album Name (Deluxe Edition)"), "album name")

@@ -587,7 +587,7 @@ async def playlist_with_rekordbox(body: PlaylistWithRekordboxBody, request: Requ
         playlist_data,
         body.rekordbox_xml_path,
     )
-    return JSONResponse(content=_sanitize_for_json(playlist_with_owned))
+    return playlist_with_owned
 
 
 @app.post("/api/match-snapshot-with-xml")
@@ -894,7 +894,7 @@ async def playlist_with_rekordbox_upload(
         f"cache_hit={'true' if 'cache_hit' in locals() and cache_hit else 'false'} cache_ttl_s={PLAYLIST_CACHE_TTL_S} cache_size={len(PLAYLIST_CACHE)} refresh={'1' if (refresh == 1) else '0'} "
         f"fetch_ms={fetch_ms:.1f} xml_ms={xml_ms:.1f} total_ms={total_ms:.1f} tracks={tracks_count}"
     )
-    return JSONResponse(content=_sanitize_for_json(playlist_with_owned))
+    return playlist_with_owned
 
 
 # =========================
