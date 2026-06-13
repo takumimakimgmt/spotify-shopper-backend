@@ -359,6 +359,11 @@ def root() -> Dict[str, Any]:
     return {"ok": True, "status": "ok"}
 
 
+@app.get("/health", include_in_schema=False)
+def render_health() -> Dict[str, Any]:
+    return health()
+
+
 # =========================
 # Core helpers
 # =========================
