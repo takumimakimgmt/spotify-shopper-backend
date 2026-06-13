@@ -17,6 +17,7 @@ from lib.rekordbox.normalizer import (
     normalize_artist,
     normalize_title_base,
     normalize_album,
+    generate_title_artist_pairs,
 )
 from lib.rekordbox.parser import load_rekordbox_library_xml
 
@@ -77,9 +78,10 @@ def mark_owned_tracks(
 
         # 2) タイトル＋アーティスト（正規化）の組み合わせ一致
         if not owned and title_norm and artist_norm:
-            key = (title_norm, artist_norm)
-            matches = lib.by_title_artist.get(key, [])
-            if matches:
+            for key in generate_title_artist_pairs(t["title"], t["artist"]):
+                matches = lib.by_title_artist.get(key, [])
+                if not matches:
+                    continue
                 rb_track = matches[0]  # 最初のマッチを使用
                 owned = True
                 owned_detail = {
@@ -89,6 +91,7 @@ def mark_owned_tracks(
                     "matched_artist": rb_track.artist,
                     "rb_track": rb_track,
                 }
+                break
 
         # 3) タイトル＋アルバム（正規化）の組み合わせ一致
         #    → アーティスト名がカタカナ／別表記でも拾えるようにする
