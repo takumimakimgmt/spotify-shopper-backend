@@ -1,0 +1,58 @@
+{
+  "tracks": [
+    {
+      "title": "Bright Lights",
+      "artist": "Artist B",
+      "album": "Album B",
+      "isrc": null
+    },
+    {
+      "title": "Goodums - Sammy Virji Remix",
+      "artist": "Sammy Virji",
+      "album": "Goodums",
+      "isrc": null
+    },
+    {
+      "title": "WHO",
+      "artist": "Port London",
+      "album": "WHO",
+      "isrc": null
+    },
+    {
+      "title": "Civic",
+      "artist": "Takumi Maki",
+      "album": "Civic",
+      "isrc": null
+    },
+    {
+      "title": "CORRUPT us - Posij & ZEP Remix",
+      "artist": "ZEP, Posij",
+      "album": "CORRUPT us (Posij & ZEP Remix)",
+      "isrc": null
+    },
+    {
+      "title": "Outer Space - JAMPAGNE Remix",
+      "artist": "Habstrakt, Roderick Porter, JAMPAGNE",
+      "album": "Heritage (Remixes)",
+      "isrc": null
+    },
+    {
+      "title": "Before Love - Extended",
+      "artist": "The Good Son",
+      "album": "Before Love",
+      "isrc": null
+    },
+    {
+      "title": "Thierry Henry - Modeā Remix",
+      "artist": "EV, Modeā",
+      "album": "Sunrise Behind The Tower Blocks",
+      "isrc": null
+    },
+    {
+      "title": "Somewhere Near Marseilles — マルセイユ辺りー",
+      "artist": "Hikaru Utada",
+      "album": "BADモード",
+      "isrc": null
+    }
+  ]
+}
