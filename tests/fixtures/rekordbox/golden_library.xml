@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <COLLECTION Entries="9">
+    <TRACK TrackID="1" Name="Bright Lights" Artist="Artist B" Album="Album B" />
+    <TRACK TrackID="2" Name="Goodums_-_Sammy_Virji_Remix" Artist="Sammy Virji" Album="Goodums" />
+    <TRACK TrackID="3" Name="WHO 160-145" Artist="Port London" Album="WHO" />
+    <TRACK TrackID="4" Name="Takumi Maki Civic Master" Artist="" Album="" />
+    <TRACK TrackID="5" Name="CORRUPT us - Posij &amp; ZEP Remix 169.98" Artist="ZEP, Posij" Album="CORRUPT us (Posij &amp; ZEP Remix)" />
+    <TRACK TrackID="6" Name="Outer Space (JAMPAGNE Remix)" Artist="Habstrakt, Roderick Porter, JAMPAGNE" Album="Heritage - Remixes" />
+    <TRACK TrackID="7" Name="Before Love (Extended)" Artist="The Good Son" Album="Before Love" />
+    <TRACK TrackID="8" Name="Thierry Henry (Modeā Extended Remix)" Artist="Ev, Modeā" Album="Thierry Henry (Modeā Extended Remix)" />
+    <TRACK TrackID="9" Name="Somewhere Near Marseilles (Sci-Fi Edit)" Artist="Hikaru Utada" Album="SCIENCE FICTION" />
+  </COLLECTION>
+</DJ_PLAYLISTS>
