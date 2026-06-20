@@ -95,6 +95,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Response,
     UploadFile,
     File,
     Form,
@@ -362,6 +363,11 @@ def root() -> Dict[str, Any]:
 @app.get("/health", include_in_schema=False)
 def render_health() -> Dict[str, Any]:
     return health()
+
+
+@app.head("/health", include_in_schema=False)
+def render_health_head() -> Response:
+    return Response(status_code=200)
 
 
 # =========================

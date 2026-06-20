@@ -17,6 +17,11 @@ class HealthRouteTests(unittest.TestCase):
         self.assertIs(payload["ok"], True)
         self.assertEqual(payload["status"], "ok")
 
+    def test_render_health_head_route_returns_ok(self):
+        response = client.head("/health")
+
+        self.assertEqual(response.status_code, 200)
+
     def test_api_health_route_still_returns_ok(self):
         response = client.get("/api/health")
 
