@@ -18,6 +18,7 @@ from lib.rekordbox.normalizer import (
     normalize_title_base,
     normalize_album,
     generate_title_artist_pairs,
+    title_version_signature,
 )
 from lib.rekordbox.parser import load_rekordbox_library_xml
 
@@ -35,15 +36,15 @@ def mark_owned_tracks(
 ) -> dict:
     """
     playlist_data: playlist_result_to_dict() の戻り（dict）
-    RekordboxライブラリXMLと突き合わせて、各 track に owned: bool と owned_detail を付与して返す。
+    RekordboxライブラリXMLと突き合わせて、各 track に owned: bool | None と owned_detail を付与して返す。
 
     判定の順番:
     1. ISRC 完全一致 → method = 'isrc'
     2. (title_norm, artist_norm) の組み合わせ一致 → method = 'exact'
        - Rekordbox側は "ARTIST - TITLE" パターンなどを含む複数候補を持つ
-    3. (title_norm, album_norm) の組み合わせ一致 → method = 'album'
+    3. (title_norm, album_norm) の組み合わせ一致 → 未確認、method = 'album'
        - 有名アーティストがカタカナ表記になっていても、タイトル＋アルバムで拾う
-    4. 同一 artist_norm 内で title_norm 類似度 >= 0.92 → method = 'fuzzy'
+    4. 同一 artist_norm 内で title_norm 類似度 >= 0.92 → 未確認、method = 'fuzzy'
 
     Args:
         playlist_data: Playlist dict with 'tracks' key
@@ -68,6 +69,27 @@ def mark_owned_tracks(
             raise TimeoutError("Library matching exceeded 20s budget")
         owned = False
         owned_detail: OwnedDetail = {}
+        review_detail: OwnedDetail = {}
+
+        def can_confirm(candidate):
+            nonlocal review_detail
+            requested_isrc = (t.get("isrc") or "").strip().upper()
+            candidate_isrc = (candidate.isrc or "").strip().upper()
+            reason = None
+            if requested_isrc and candidate_isrc and requested_isrc != candidate_isrc:
+                reason = "isrc_conflict"
+            elif title_version_signature(t["title"]) != title_version_signature(
+                candidate.title
+            ):
+                reason = "version_mismatch"
+            if reason:
+                review_detail = {
+                    "method": reason,
+                    "matched_title": candidate.title,
+                    "matched_artist": candidate.artist,
+                }
+                return False
+            return True
 
         title_norm = normalize_title_base(t["title"])
         artist_norm = normalize_artist(t["artist"])
@@ -76,7 +98,7 @@ def mark_owned_tracks(
         # 1) ISRC 完全一致
         isrc = t.get("isrc")
         if isrc:
-            rb_track = lib.by_isrc.get(isrc.upper())
+            rb_track = lib.by_isrc.get(isrc.strip().upper())
             if rb_track:
                 owned = True
                 owned_detail = {
@@ -93,7 +115,12 @@ def mark_owned_tracks(
                 matches = lib.by_title_artist.get(key, [])
                 if not matches:
                     continue
-                rb_track = matches[0]  # 最初のマッチを使用
+                compatible = [
+                    candidate for candidate in matches if can_confirm(candidate)
+                ]
+                if not compatible:
+                    continue
+                rb_track = compatible[0]
                 owned = True
                 owned_detail = {
                     "method": MatchMethod.EXACT.value,
@@ -110,15 +137,15 @@ def mark_owned_tracks(
             key2 = (title_norm, album_norm)
             matches = lib.by_title_album.get(key2, [])
             if matches:
-                rb_track = matches[0]
-                owned = True
-                owned_detail = {
-                    "method": MatchMethod.ALBUM.value,
-                    "score": 1.0,
-                    "matched_title": rb_track.title,
-                    "matched_artist": rb_track.artist,
-                    "rb_track": rb_track,
-                }
+                for rb_track in matches:
+                    if can_confirm(rb_track):
+                        review_detail = {
+                            "method": MatchMethod.ALBUM.value,
+                            "score": 1.0,
+                            "matched_title": rb_track.title,
+                            "matched_artist": rb_track.artist,
+                        }
+                        break
 
         # 4) 同一アーティスト内でタイトル類似度を見る（かなり閾値高め）
         if not owned and title_norm and artist_norm:
@@ -129,13 +156,14 @@ def mark_owned_tracks(
                 if candidate_index % 32 == 0 and time.monotonic() > deadline:
                     raise TimeoutError("Library matching exceeded 20s budget")
                 score = _similar(title_norm, normalize_title_base(rb.title))
+                if score >= 0.92 and not can_confirm(rb):
+                    continue
                 if score > best_score:
                     best_score = score
                     best_track = rb
 
             if best_score >= 0.92 and best_track:
-                owned = True
-                owned_detail = {
+                review_detail = {
                     "method": MatchMethod.FUZZY.value,
                     "score": best_score,
                     "matched_title": best_track.title,
@@ -144,6 +172,9 @@ def mark_owned_tracks(
                 }
                 fuzzy_count += 1
 
+        if not owned and review_detail:
+            owned = None
+            owned_detail = review_detail
         t["owned"] = owned
         t["owned_detail"] = owned_detail
         # 後方互換性: owned_reason フィールドも設定
