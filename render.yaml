@@ -28,11 +28,11 @@ services:
       - key: REKORDBOX_CACHE_ENABLED
         value: false
       - key: MAX_UPLOAD_SIZE
-        value: 52428800
+        value: 3145728
       - key: REKORDBOX_MAX_XML_MB
-        value: 50
+        value: 3
       - key: REQUEST_SIZE_LIMIT_BYTES
-        value: 57671680
+        value: 4400000
       - key: SPOTIFY_MARKET
         value: JP,US,GB
       - key: ALLOWED_ORIGINS

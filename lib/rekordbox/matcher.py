@@ -19,6 +19,8 @@ from lib.rekordbox.normalizer import (
     normalize_album,
     generate_title_artist_pairs,
     title_version_signature,
+    artist_identity,
+    title_annotation_signature,
 )
 from lib.rekordbox.parser import load_rekordbox_library_xml
 
@@ -82,6 +84,14 @@ def mark_owned_tracks(
                 candidate.title
             ):
                 reason = "version_mismatch"
+            elif title_annotation_signature(t["title"]) != title_annotation_signature(
+                candidate.title
+            ):
+                reason = "title_annotation_mismatch"
+            elif candidate.artist.strip() and artist_identity(
+                t["artist"]
+            ) != artist_identity(candidate.artist):
+                reason = "artist_mismatch"
             if reason:
                 review_detail = {
                     "method": reason,
@@ -186,7 +196,8 @@ def mark_owned_tracks(
         f"[rekordbox] match tracks={track_total} fuzzy={fuzzy_count} match_ms={match_ms}ms"
     )
 
-    playlist_data.setdefault("meta", {})["rekordbox"] = {
+    playlist_data.setdefault("meta", {})["ownership_rules_version"] = 3
+    playlist_data["meta"]["rekordbox"] = {
         "track_total": track_total,
         "fuzzy_count": fuzzy_count,
         "match_ms": match_ms,

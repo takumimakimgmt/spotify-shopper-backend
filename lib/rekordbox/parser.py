@@ -23,15 +23,15 @@ from lib.rekordbox.normalizer import (
 
 def _max_xml_size_bytes() -> int:
     try:
-        megabytes = int((os.getenv("REKORDBOX_MAX_XML_MB") or "50").strip())
+        megabytes = int((os.getenv("REKORDBOX_MAX_XML_MB") or "3").strip())
     except (TypeError, ValueError):
-        megabytes = 50
-    if not 1 <= megabytes <= 512:
-        megabytes = 50
+        megabytes = 3
+    if not 1 <= megabytes <= 3:
+        megabytes = 3
     return megabytes * 1024 * 1024
 
 
-# XML ファイルサイズ上限（環境変数で設定可能、デフォルト: 50 MB）
+# XML ファイルサイズ上限（環境変数で設定可能、デフォルト: 3 MB）
 MAX_XML_SIZE_BYTES = _max_xml_size_bytes()
 
 
