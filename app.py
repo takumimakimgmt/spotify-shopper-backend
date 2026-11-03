@@ -98,7 +98,7 @@ def _sanitize_for_json(obj):
 
 
 import tempfile
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional
 
 from fastapi import (
     FastAPI,
@@ -113,7 +113,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
 
 from core import (
     fetch_playlist_tracks_generic,
@@ -145,75 +144,14 @@ logger.setLevel(logging.INFO)
 # =========================
 
 
-class StoreLinksModel(BaseModel):
-    beatport: Optional[str] = None
-    bandcamp: Optional[str] = None
-    itunes: Optional[str] = None
-
-
-class TrackModel(BaseModel):
-    title: str
-    artist: str
-    album: Optional[str] = None
-    isrc: Optional[str] = None
-    spotify_url: Optional[str] = None
-    apple_url: Optional[str] = None
-    links: Optional[StoreLinksModel] = None
-    owned: Optional[bool] = None
-    owned_reason: Optional[str] = None
-    track_key_primary: Optional[str] = (
-        None  # ISRC-based or fallback (server-determined for state sync)
-    )
-    track_key_fallback: Optional[str] = None  # normalized(title+artist+album) backup
-    track_key_primary_type: Literal["isrc", "norm"] = (
-        "norm"  # "isrc" | "norm" (UI hint: isrc=confident, norm=ambiguous)
-    )
-    track_key_version: str = (
-        "v1"  # version for future-proof migrations (normalize rules evolution)
-    )
-
-
-class PlaylistMetaModel(BaseModel):
-    model_config = {"extra": "allow"}  # Allow unknown fields to pass through
-
-    cache_hit: Optional[bool] = None
-    cache_ttl_s: Optional[int] = None
-    refresh: bool = False
-    fetch_ms: Optional[float] = None
-    enrich_ms: Optional[float] = None
-    total_backend_ms: Optional[float] = None
-    total_api_ms: Optional[float] = None
-    # Apple-specific meta flags
-    apple_strategy: Optional[str] = None  # 'html'
-    apple_mode: Optional[str] = None  # 'auto' | 'fast' | 'legacy'
-    apple_legacy_used: Optional[bool] = None
-    apple_enrich_skipped: Optional[bool] = None
-    reason: Optional[str] = None
-    seen_catalog_playlist_api: Optional[bool] = None
-    apple_api_candidates: Optional[list] = None
-    apple_response_candidates: Optional[list] = None
-    apple_request_candidates: Optional[list] = None
-    apple_xhr_fetch_requests: Optional[list] = None
-    json_responses_any_domain: Optional[list] = None
-    apple_console_errors: Optional[list] = None
-    apple_page_errors: Optional[list] = None
-    apple_page_title: Optional[str] = None
-    apple_html_snippet: Optional[str] = None
-    blocked_hint: Optional[bool] = None
-
-
-class PlaylistResponse(BaseModel):
-    playlist_id: str
-    playlist_name: str
-    playlist_url: Optional[str] = None
-    tracks: List[TrackModel]
-    meta: Optional[PlaylistMetaModel] = None
-
-
-class PlaylistWithRekordboxBody(BaseModel):
-    url: str
-    rekordbox_xml_path: str
-    source: Optional[str] = "spotify"
+from lib.api_models import (
+    StoreLinksModel as StoreLinksModel,
+    LibraryMatchModel as LibraryMatchModel,
+    TrackModel as TrackModel,
+    PlaylistMetaModel as PlaylistMetaModel,
+    PlaylistResponse as PlaylistResponse,
+    PlaylistWithRekordboxBody as PlaylistWithRekordboxBody,
+)
 
 
 # =========================
@@ -867,6 +805,7 @@ async def match_snapshot_with_xml(
     for original, matched_track in zip(snap["tracks"], matched_tracks):
         original["owned"] = matched_track.get("owned")
         original["owned_reason"] = matched_track.get("owned_reason")
+        original["library_match"] = matched_track.get("library_match")
         updated_tracks.append(original)
 
     snap["meta"] = matched.get("meta", {})

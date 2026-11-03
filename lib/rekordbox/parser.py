@@ -187,6 +187,7 @@ def load_rekordbox_library_xml(
     xml_mb = xml_bytes / (1024 * 1024)
 
     library = RekordboxLibrary(
+        track_count=track_count,
         by_isrc=by_isrc,
         by_title_artist=by_title_artist,
         by_artist_norm=by_artist_norm,

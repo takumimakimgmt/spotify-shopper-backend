@@ -63,3 +63,4 @@ class RekordboxLibrary:
     by_title_artist: Dict[Tuple[str, str], List[RekordboxTrack]]
     by_artist_norm: Dict[str, List[RekordboxTrack]]
     by_title_album: Dict[Tuple[str, str], List[RekordboxTrack]]
+    track_count: int = 0
