@@ -10,8 +10,9 @@ import base64
 import requests
 from dotenv import load_dotenv
 
-# Load .env file if it exists
-env_file = os.path.join(os.path.dirname(__file__), ".env")
+# Load local env files only when this diagnostic is run explicitly.
+project_root = os.path.dirname(os.path.dirname(__file__))
+env_file = os.path.join(project_root, ".env")
 if os.path.exists(env_file):
     print(f"✓ Loading .env from: {env_file}")
     load_dotenv(env_file)
@@ -19,7 +20,7 @@ else:
     print(f"⚠ No .env file found at: {env_file}")
 
 # Load .env.local as fallback
-env_local_file = os.path.join(os.path.dirname(__file__), ".env.local")
+env_local_file = os.path.join(project_root, ".env.local")
 if os.path.exists(env_local_file):
     print(f"✓ Loading .env.local from: {env_local_file}")
     load_dotenv(env_local_file, override=True)
@@ -31,10 +32,8 @@ print("=" * 60)
 client_id = os.getenv("SPOTIFY_CLIENT_ID")
 client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-print(f"SPOTIFY_CLIENT_ID: {client_id[:10] + '...' if client_id else 'NOT SET'}")
-print(
-    f"SPOTIFY_CLIENT_SECRET: {client_secret[:10] + '...' if client_secret else 'NOT SET'}"
-)
+print(f"SPOTIFY_CLIENT_ID: {'SET' if client_id else 'NOT SET'}")
+print(f"SPOTIFY_CLIENT_SECRET: {'SET' if client_secret else 'NOT SET'}")
 
 if not client_id or not client_secret:
     print("\n❌ ERROR: Spotify credentials not set!")

@@ -7,18 +7,38 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
     startCommand: |
-      uvicorn app:app --host 0.0.0.0 --port $PORT
+      uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --limit-concurrency 16 --timeout-keep-alive 5
     envVars:
       - key: SPOTIFY_CLIENT_ID
         sync: false
       - key: SPOTIFY_CLIENT_SECRET
         sync: false
+      - key: BACKEND_PROXY_TOKEN
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: APP_ENV
+        value: production
+      - key: BACKEND_RATE_LIMIT_PER_MINUTE
+        value: 60
+      - key: TRUST_PROXY_HEADERS
+        value: true
+      - key: BACKEND_MAX_CONCURRENT_REQUESTS
+        value: 2
+      - key: REKORDBOX_CACHE_ENABLED
+        value: false
+      - key: MAX_UPLOAD_SIZE
+        value: 52428800
+      - key: REKORDBOX_MAX_XML_MB
+        value: 50
+      - key: REQUEST_SIZE_LIMIT_BYTES
+        value: 57671680
       - key: SPOTIFY_MARKET
         value: JP,US,GB
       - key: ALLOWED_ORIGINS
-        value: https://playlist-shopper.vercel.app,http://localhost:3000,http://127.0.0.1:3000
-      - key: ALLOWED_ORIGIN_REGEX
-        value: ^https://.*\.vercel\.app$|^https://playlist-shopper\.vercel\.app$|^https://spotify-shopper\.vercel\.app$|^http://localhost:3000$|^http://127\.0\.0\.1:3000$
+        value: https://playlist-shopper.vercel.app
+      - key: CORS_ALLOW_CREDENTIALS
+        value: false
       - key: PYTHON_VERSION
         value: 3.11.9
     healthCheckPath: /health

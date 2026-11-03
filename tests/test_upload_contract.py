@@ -35,7 +35,7 @@ def _fake_playlist_result_to_dict(_result):
     }
 
 
-def _fake_apply_rekordbox_owned_flags(playlist_data, _library_xml_path):
+def _fake_apply_rekordbox_owned_flags(playlist_data, _library_xml_path, **_kwargs):
     playlist_data["tracks"][0]["owned"] = True
     playlist_data["tracks"][0]["owned_reason"] = "isrc"
     playlist_data["tracks"][1]["owned"] = False
@@ -67,7 +67,10 @@ class UploadContractTests(unittest.TestCase):
     ):
         response = client.post(
             "/api/playlist-with-rekordbox-upload",
-            data={"url": "https://open.spotify.com/playlist/abc", "source": "spotify"},
+            data={
+                "url": "https://open.spotify.com/playlist/0jKqvXbsroCPdccFmORnPz",
+                "source": "spotify",
+            },
             files={"file": ("library.xml", b"<DJ_PLAYLISTS />", "text/xml")},
         )
 

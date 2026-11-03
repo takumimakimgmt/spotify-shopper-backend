@@ -54,3 +54,6 @@ __pycache__/
 
 # Project-specific noise
 _context/
+
+# Local analysis exports
+output/

@@ -36,7 +36,11 @@ from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
 _ENV = os.getenv("ENV", "prod").lower()
 _TTL_SECONDS = 3600 if _ENV == "dev" else 21600  # dev:1h, prod:6h
 _CACHE_VERSION = "v2"  # v2: includes apple_mode in cache keys
-_PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(maxsize=256, ttl=_TTL_SECONDS)
+_PLAYLIST_CACHE: TTLCache[str, dict] = TTLCache(
+    maxsize=16 * 1024 * 1024,
+    ttl=_TTL_SECONDS,
+    getsizeof=lambda value: len(json.dumps(value, ensure_ascii=False).encode("utf-8")),
+)
 APPLE_HTTP_TIMEOUT_S = float(os.getenv("APPLE_HTTP_TIMEOUT_S", "20"))
 APPLE_HTTP_RETRIES = int(os.getenv("APPLE_HTTP_RETRIES", "2"))
 APPLE_removed_browser_TIMEOUT_S = float(

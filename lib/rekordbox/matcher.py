@@ -30,6 +30,8 @@ def _similar(a: str, b: str) -> float:
 def mark_owned_tracks(
     playlist_data: dict,
     rekordbox_xml_path: str | Path,
+    *,
+    content_hash: str | None = None,
 ) -> dict:
     """
     playlist_data: playlist_result_to_dict() の戻り（dict）
@@ -51,10 +53,19 @@ def mark_owned_tracks(
         Modified playlist_data with 'owned' and 'owned_detail' added to each track
     """
     t0_match = time.time()
-    lib = load_rekordbox_library_xml(rekordbox_xml_path)
+    lib = load_rekordbox_library_xml(
+        rekordbox_xml_path,
+        content_hash=content_hash,
+    )
     fuzzy_count = 0
 
-    for t in playlist_data.get("tracks", []):
+    deadline = time.monotonic() + 20.0
+    tracks = playlist_data.get("tracks", [])
+    if len(tracks) > 10_000:
+        raise ValueError("Playlist exceeds matching limit (10000 tracks)")
+    for t in tracks:
+        if time.monotonic() > deadline:
+            raise TimeoutError("Library matching exceeded 20s budget")
         owned = False
         owned_detail: OwnedDetail = {}
 
@@ -114,7 +125,9 @@ def mark_owned_tracks(
             candidates = lib.by_artist_norm.get(artist_norm, [])
             best_score = 0.0
             best_track = None
-            for rb in candidates:
+            for candidate_index, rb in enumerate(candidates):
+                if candidate_index % 32 == 0 and time.monotonic() > deadline:
+                    raise TimeoutError("Library matching exceeded 20s budget")
                 score = _similar(title_norm, normalize_title_base(rb.title))
                 if score > best_score:
                     best_score = score

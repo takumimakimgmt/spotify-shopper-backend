@@ -2,6 +2,8 @@ from __future__ import annotations
 
 
 import os
+import copy
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -14,15 +16,22 @@ if _ENV_LOCAL.exists():
 
 
 # Upload size limit (bytes). Used by /api/playlist-with-rekordbox-upload.
-def _env_int(name: str, default: int) -> int:
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int = 512 * 1024 * 1024,
+) -> int:
     try:
         v = (os.getenv(name) or "").strip()
-        return int(v) if v else default
-    except Exception:
+        value = int(v) if v else default
+        return value if minimum <= value <= maximum else default
+    except (TypeError, ValueError):
         return default
 
 
-MAX_UPLOAD_SIZE = _env_int("MAX_UPLOAD_SIZE", 10 * 1024 * 1024)  # default 10MB
+MAX_UPLOAD_SIZE = _env_int("MAX_UPLOAD_SIZE", 50 * 1024 * 1024)
 
 import inspect
 from contextlib import asynccontextmanager
@@ -101,9 +110,9 @@ from fastapi import (
     Form,
     Request,
 )
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from core import (
@@ -116,6 +125,11 @@ from core import _PLAYLIST_CACHE as PLAYLIST_CACHE  # TTLCache
 from core import _TTL_SECONDS as PLAYLIST_CACHE_TTL_S
 from core import _CACHE_VERSION as CACHE_VERSION
 from lib.rekordbox import mark_owned_tracks
+from lib.http_middleware import (
+    BackendProtectionMiddleware,
+    RequestSizeLimitMiddleware,
+    WorkloadLimitMiddleware,
+)
 import logging
 import re
 import json
@@ -311,32 +325,13 @@ app.add_middleware(
 # Add GZip middleware for response compression (reduces payload size for large JSON)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Add request body size limit middleware (protect against extremely large payloads)
-from starlette.middleware.base import BaseHTTPMiddleware
-
 # Allow slightly larger than XML limit to account for multipart overhead (fields + boundaries)
-REQUEST_SIZE_LIMIT_BYTES = int(
-    os.getenv("REQUEST_SIZE_LIMIT_BYTES", str(70 * 1024 * 1024))
+REQUEST_SIZE_LIMIT_BYTES = _env_int(
+    "REQUEST_SIZE_LIMIT_BYTES", MAX_UPLOAD_SIZE + 5 * 1024 * 1024
 )
-
-
-class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method in ("POST", "PUT", "PATCH"):
-            content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > REQUEST_SIZE_LIMIT_BYTES:
-                logger.warning(
-                    f"[RequestSizeLimit] Rejected oversized request: {content_length} bytes from {request.client}"
-                )
-                max_mb = REQUEST_SIZE_LIMIT_BYTES / (1024 * 1024)
-                return JSONResponse(
-                    status_code=413,
-                    content={"detail": f"Request body too large (max {max_mb:.0f}MB)"},
-                )
-        return await call_next(request)
-
-
-app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware, max_bytes=REQUEST_SIZE_LIMIT_BYTES)
+app.add_middleware(WorkloadLimitMiddleware)
+app.add_middleware(BackendProtectionMiddleware)
 
 
 def _log_startup():
@@ -390,18 +385,142 @@ def _sanitize_url(raw: str) -> str:
     return s
 
 
+def _public_error(error: Exception) -> str:
+    environment = (os.getenv("APP_ENV") or "local").strip().lower()
+    if environment in {"local", "dev", "development", "test"}:
+        return str(error)
+    return "Request could not be processed. Check your input and try again."
+
+
+def _validate_playlist_input(raw: str, source: str) -> str:
+    """Only accept Spotify playlist identities before any outbound request."""
+    from urllib.parse import urlsplit
+
+    clean = _sanitize_url(raw)
+    if source.strip().lower() != "spotify" or len(clean) > 2048:
+        raise HTTPException(
+            status_code=400, detail="Use a Spotify playlist URL, URI, or ID."
+        )
+    identity = clean
+    if clean.startswith("spotify:playlist:"):
+        identity = clean.removeprefix("spotify:playlist:")
+    elif "://" in clean:
+        try:
+            parsed = urlsplit(clean)
+            if (
+                parsed.scheme not in {"https", "http"}
+                or parsed.hostname != "open.spotify.com"
+                or parsed.username
+                or parsed.password
+                or parsed.port not in {None, 80, 443}
+            ):
+                raise ValueError("Unsupported URL")
+            match = re.fullmatch(r"/playlist/([A-Za-z0-9]{22})/?", parsed.path)
+            if not match:
+                raise ValueError("Invalid playlist path")
+            identity = match.group(1)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="Use a Spotify playlist URL, URI, or ID."
+            )
+    if not re.fullmatch(r"[A-Za-z0-9]{22}", identity):
+        raise HTTPException(
+            status_code=400, detail="Use a Spotify playlist URL, URI, or ID."
+        )
+    return f"https://open.spotify.com/playlist/{identity}"
+
+
+XML_CONTENT_TYPES = {"text/xml", "application/xml", "text/plain"}
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _save_xml_upload(file: UploadFile) -> tuple[str, str, int]:
+    if file.content_type not in XML_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400, detail="XML ファイルをアップロードしてください"
+        )
+
+    tmp_path: str | None = None
+    total = 0
+    digest = hashlib.sha256()
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+            tmp_path = tmp.name
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"XML が大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）",
+                    )
+                digest.update(chunk)
+                tmp.write(chunk)
+    except Exception:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    if total == 0:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="空の XML ファイルです")
+    if tmp_path is None:
+        raise HTTPException(
+            status_code=500, detail="XML 一時ファイルの作成に失敗しました"
+        )
+    return tmp_path, digest.hexdigest(), total
+
+
+def _remove_temp_file(path: str | None) -> None:
+    if path:
+        Path(path).unlink(missing_ok=True)
+
+
+def _resolve_local_xml_path(raw_path: str) -> Path:
+    enabled = _parse_bool(os.getenv("ENABLE_LOCAL_PATH_API"), default=False)
+    if _APP_ENV not in {"local", "development", "dev"} or not enabled:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    configured_root = (os.getenv("REKORDBOX_LOCAL_ROOT") or "").strip()
+    if not configured_root:
+        raise HTTPException(
+            status_code=503,
+            detail="REKORDBOX_LOCAL_ROOT is required for the local path API",
+        )
+
+    root = Path(configured_root).expanduser().resolve()
+    candidate = Path(raw_path).expanduser().resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise HTTPException(
+            status_code=403, detail="XML path is outside the allowed root"
+        )
+    if not candidate.is_file():
+        raise HTTPException(status_code=400, detail="Rekordbox XML file was not found")
+    return candidate
+
+
 def _apply_rekordbox_owned_flags(
     playlist_data: Dict[str, Any],
     library_xml_path: str,
+    *,
+    content_hash: str | None = None,
 ) -> Dict[str, Any]:
     """Rekordbox ライブラリ XML を読み込み、owned フラグを付与。"""
     try:
         # mark_owned_tracks expects a path and will load the XML itself.
-        return mark_owned_tracks(playlist_data, library_xml_path)
+        return mark_owned_tracks(
+            playlist_data,
+            library_xml_path,
+            content_hash=content_hash,
+        )
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to apply Rekordbox owned flags: {e}",
+            detail=f"Failed to apply Rekordbox owned flags: {_public_error(e)}",
         )
 
 
@@ -441,7 +560,7 @@ async def get_playlist(
     t0_total = time.time()
 
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
-    clean_url = _sanitize_url(url)
+    clean_url = _validate_playlist_input(url, source)
     normalized_url = normalize_playlist_url(clean_url)
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
@@ -471,7 +590,7 @@ async def get_playlist(
         if src == "apple":
             cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
         bypass = refresh == 1
-        cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
+        cached = None if bypass else copy.deepcopy(PLAYLIST_CACHE.get(cache_key))
         cache_hit = cached is not None
         if cached is not None:
             result = cached
@@ -492,7 +611,11 @@ async def get_playlist(
         if enrich_isrc and isinstance(result, dict):
             try:
                 items = result.get("items", [])
-                updated = enrich_isrc_for_items(items, limit=isrc_limit)
+                updated = await run_in_threadpool(
+                    enrich_isrc_for_items,
+                    items,
+                    limit=min(max(isrc_limit or 20, 1), 20),
+                )
                 result["items"] = items
                 result.setdefault("meta", {})
                 result["meta"]["isrc_enriched"] = updated
@@ -515,7 +638,7 @@ async def get_playlist(
                 and not result.get("error")
                 and len(data.get("tracks", [])) > 0
             ):
-                PLAYLIST_CACHE[cache_key] = result
+                PLAYLIST_CACHE[cache_key] = copy.deepcopy(result)
         except Exception:
             pass
 
@@ -563,16 +686,16 @@ async def get_playlist(
             except Exception:
                 pass
         logger.error(
-            f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}"
+            f"[api/playlist] error for raw_url={url} clean_url={clean_url} source={src}: {type(e).__name__}"
         )
         # Return structured detail including meta to aid client-side separation
         raise HTTPException(
             status_code=400,
             detail={
-                "error": str(e),
+                "error": _public_error(e),
                 "used_source": src,
                 "url": clean_url,
-                "meta": error_meta,
+                "meta": {},
             },
         )
 
@@ -586,17 +709,20 @@ async def playlist_with_rekordbox(body: PlaylistWithRekordboxBody, request: Requ
       "rekordbox_xml_path": "/Users/xxx/Desktop/rekordbox_collection.xml"
     }
     """
+    clean_url = _validate_playlist_input(body.url, body.source)
+    local_xml_path = _resolve_local_xml_path(body.rekordbox_xml_path)
     try:
         result = await fetch_playlist_tracks_generic(
-            getattr(body, "source", "spotify"), body.url, app=request.app
+            "spotify", clean_url, app=request.app
         )
         playlist_data = playlist_result_to_dict(result)
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": str(e)})
+        raise HTTPException(status_code=400, detail={"error": _public_error(e)})
 
-    playlist_with_owned = _apply_rekordbox_owned_flags(
+    playlist_with_owned = await run_in_threadpool(
+        _apply_rekordbox_owned_flags,
         playlist_data,
-        body.rekordbox_xml_path,
+        str(local_xml_path),
     )
     return playlist_with_owned
 
@@ -649,27 +775,47 @@ async def match_snapshot_with_xml(
             status_code=400, detail="snapshot.tracks は配列である必要があります"
         )
 
+    playlist = snap.get("playlist", {})
+    if not isinstance(playlist, dict) or len(snap["tracks"]) > 1000:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid snapshot playlist or track count (max 1000)",
+        )
+    for track in snap["tracks"]:
+        if not isinstance(track, dict) or not isinstance(track.get("links", {}), dict):
+            raise HTTPException(status_code=400, detail="Invalid snapshot track")
+        for key in (
+            "title",
+            "artist",
+            "album",
+            "isrc",
+            "track_key_primary",
+            "track_key_fallback",
+        ):
+            value = track.get(key)
+            if value is not None and (not isinstance(value, str) or len(value) > 2048):
+                raise HTTPException(
+                    status_code=400, detail="Invalid snapshot track field"
+                )
+        if not isinstance(track.get("title"), str) or not isinstance(
+            track.get("artist"), str
+        ):
+            raise HTTPException(
+                status_code=400, detail="Snapshot tracks require title and artist"
+            )
+
     # XML ファイル必須＆検証
     if file is None:
         raise HTTPException(
             status_code=400, detail="XML ファイルを 'file' フィールドで送信してください"
         )
-    if file.content_type not in ("text/xml", "application/xml", "text/plain"):
-        raise HTTPException(
-            status_code=400, detail="XML ファイルをアップロードしてください"
-        )
-
     try:
-        xml_bytes = await file.read()
+        tmp_path, xml_hash, _xml_size = await _save_xml_upload(file)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"XML 読み込みに失敗しました: {e}")
-
-    if not xml_bytes:
-        raise HTTPException(status_code=400, detail="空の XML ファイルです")
-    if len(xml_bytes) > MAX_UPLOAD_SIZE:
         raise HTTPException(
-            status_code=413,
-            detail=f"XML が大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）",
+            status_code=400, detail=f"XML 読み込みに失敗しました: {_public_error(e)}"
         )
 
     # 既存の mark_owned_tracks は playlist 型（/api/playlist の返却）を期待するため、
@@ -699,19 +845,15 @@ async def match_snapshot_with_xml(
     }
 
     # XML を一時ファイルへ書き出して照合
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-            tmp.write(xml_bytes)
-            tmp_path = tmp.name
-
-        matched = _apply_rekordbox_owned_flags(playlist_like, tmp_path)
+        matched = await run_in_threadpool(
+            _apply_rekordbox_owned_flags,
+            playlist_like,
+            tmp_path,
+            content_hash=xml_hash,
+        )
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        _remove_temp_file(tmp_path)
 
     # matched.tracks には owned/owned_reason が入っている想定。
     matched_tracks: List[Dict[str, Any]] = matched.get("tracks", [])
@@ -758,10 +900,10 @@ async def playlist_with_rekordbox_upload(
 
     t0_total = time.time()
 
-    # file は任意。ある場合は後で content-type とサイズ検証を行う。
+    # file は任意。ある場合はSpotify取得前に検証して一時保存する。
 
     # Sanitize URL defensively and server-side fallback: if the URL clearly points to Apple Music, prefer apple
-    clean_url = _sanitize_url(url)
+    clean_url = _validate_playlist_input(url, source)
     normalized_url = normalize_playlist_url(clean_url)
     src = (source or "spotify").lower()
     if "music.apple.com" in (clean_url or "").lower():
@@ -774,6 +916,19 @@ async def playlist_with_rekordbox_upload(
     logger.info(
         f"[api/playlist-with-rekordbox-upload] raw_url={url} clean_url={clean_url} normalized_url={normalized_url} source_param={source} apple_mode={mode} -> using source={src}"
     )
+
+    tmp_path: str | None = None
+    xml_hash: str | None = None
+    if file is not None:
+        try:
+            tmp_path, xml_hash, _xml_size = await _save_xml_upload(file)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ファイル読み込みに失敗しました: {_public_error(e)}",
+            )
 
     try:
         t0_fetch = time.time()
@@ -788,7 +943,7 @@ async def playlist_with_rekordbox_upload(
         if src == "apple":
             cache_key = f"{cache_key}:enrich={effective_enrich_spotify}:mode={mode}"
         bypass = refresh == 1
-        cached = None if bypass else PLAYLIST_CACHE.get(cache_key)
+        cached = None if bypass else copy.deepcopy(PLAYLIST_CACHE.get(cache_key))
         cache_hit = cached is not None
         if cached is not None:
             result = cached
@@ -817,10 +972,11 @@ async def playlist_with_rekordbox_upload(
                 and not result.get("error")
                 and len(playlist_data.get("tracks", [])) > 0
             ):
-                PLAYLIST_CACHE[cache_key] = result
+                PLAYLIST_CACHE[cache_key] = copy.deepcopy(result)
         except Exception:
             pass
     except Exception as e:
+        _remove_temp_file(tmp_path)
         error_meta = getattr(e, "meta", {}) if hasattr(e, "meta") else {}
         if src == "apple" and not error_meta:
             try:
@@ -836,15 +992,15 @@ async def playlist_with_rekordbox_upload(
             except Exception:
                 pass
         logger.error(
-            f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {e} meta={error_meta}"
+            f"[api/playlist-with-rekordbox-upload] error for raw_url={url} clean_url={clean_url} source={src}: {type(e).__name__}"
         )
         raise HTTPException(
             status_code=400,
             detail={
-                "error": str(e),
+                "error": _public_error(e),
                 "used_source": src,
                 "url": clean_url,
-                "meta": error_meta,
+                "meta": {},
             },
         )
 
@@ -854,48 +1010,19 @@ async def playlist_with_rekordbox_upload(
     total_ms = 0
 
     # file がある場合だけ Rekordbox 照合を行う
-    if file is not None:
-        if file.content_type not in ("text/xml", "application/xml", "text/plain"):
-            raise HTTPException(
-                status_code=400, detail="XML ファイルをアップロードしてください。"
-            )
-
-        try:
-            contents = await file.read()
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"ファイル読み込みに失敗しました: {e}"
-            )
-
-        if not contents:
-            raise HTTPException(status_code=400, detail="空のファイルです。")
-
-        if len(contents) > MAX_UPLOAD_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"ファイルが大きすぎます（上限 {MAX_UPLOAD_SIZE} バイト）。",
-            )
-
-        tmp_path = None
+    if tmp_path is not None:
         try:
             t0_xml = time.time()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
-                tmp.write(contents)
-                tmp_path = tmp.name
-
-            playlist_with_owned = _apply_rekordbox_owned_flags(
+            playlist_with_owned = await run_in_threadpool(
+                _apply_rekordbox_owned_flags,
                 playlist_data,
                 tmp_path,
+                content_hash=xml_hash,
             )
             t1_xml = time.time()
             xml_ms = (t1_xml - t0_xml) * 1000
         finally:
-            # 後始末
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+            _remove_temp_file(tmp_path)
 
     t1_total = time.time()
     total_ms = (t1_total - t0_total) * 1000
