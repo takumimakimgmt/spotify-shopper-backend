@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 import time
@@ -22,7 +23,7 @@ from lib.rekordbox.normalizer import (
     artist_identity,
     title_annotation_signature,
 )
-from lib.rekordbox.parser import load_rekordbox_library_xml
+from lib.rekordbox.parser import load_rekordbox_library_xml, _get_file_hash
 
 
 def _similar(a: str, b: str) -> float:
@@ -56,9 +57,10 @@ def mark_owned_tracks(
         Modified playlist_data with 'owned' and 'owned_detail' added to each track
     """
     t0_match = time.time()
+    library_hash = content_hash or _get_file_hash(Path(rekordbox_xml_path))
     lib = load_rekordbox_library_xml(
         rekordbox_xml_path,
-        content_hash=content_hash,
+        content_hash=library_hash,
     )
     fuzzy_count = 0
 
@@ -189,6 +191,17 @@ def mark_owned_tracks(
         t["owned_detail"] = owned_detail
         # 後方互換性: owned_reason フィールドも設定
         t["owned_reason"] = owned_detail.get("method")
+        # `owned` remains a compatibility field; absence applies only to this XML.
+        t["library_match"] = {
+            "status": "matched"
+            if owned
+            else "review"
+            if owned is None
+            else "not_found",
+            "reason": t["owned_reason"] or "no_match",
+            "matched_title": owned_detail.get("matched_title"),
+            "matched_artist": owned_detail.get("matched_artist"),
+        }
 
     match_ms = int((time.time() - t0_match) * 1000)
     track_total = len(playlist_data.get("tracks", []))
@@ -199,6 +212,10 @@ def mark_owned_tracks(
     playlist_data.setdefault("meta", {})["ownership_rules_version"] = 3
     playlist_data["meta"]["rekordbox"] = {
         "track_total": track_total,
+        "library_track_count": lib.track_count,
+        "library_sha256": library_hash,
+        "scope": "selected_xml",
+        "matched_at": datetime.now(timezone.utc).isoformat(),
         "fuzzy_count": fuzzy_count,
         "match_ms": match_ms,
     }
