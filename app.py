@@ -857,21 +857,16 @@ async def match_snapshot_with_xml(
 
     # matched.tracks には owned/owned_reason が入っている想定。
     matched_tracks: List[Dict[str, Any]] = matched.get("tracks", [])
-    # track_key_primary を使って対応付けし、snap.tracks を更新
-    index_by_key: Dict[str, Dict[str, Any]] = {}
-    for mt in matched_tracks:
-        key = mt.get("track_key_primary") or mt.get("track_key_fallback")
-        if key:
-            index_by_key[key] = mt
-
-    updated_tracks: List[Dict[str, Any]] = []
-    for t in snap.get("tracks", []):
-        key = t.get("track_key_primary") or t.get("track_key_fallback")
-        mt = index_by_key.get(key)
-        if mt:
-            t["owned"] = mt.get("owned")
-            t["owned_reason"] = mt.get("owned_reason")
-        updated_tracks.append(t)
+    # Matching preserves order. Keys can collide across remix/extended versions.
+    if len(matched_tracks) != len(snap["tracks"]):
+        raise HTTPException(
+            status_code=500, detail="Matching returned an incomplete result"
+        )
+    updated_tracks = []
+    for original, matched_track in zip(snap["tracks"], matched_tracks):
+        original["owned"] = matched_track.get("owned")
+        original["owned_reason"] = matched_track.get("owned_reason")
+        updated_tracks.append(original)
 
     snap["tracks"] = updated_tracks
     # 返却：PlaylistSnapshotV1（入力を更新したもの）

@@ -159,7 +159,7 @@ def load_rekordbox_library_xml(
 
         # ISRC index
         if isrc:
-            by_isrc[isrc.upper()] = info
+            by_isrc[isrc.strip().upper()] = info
 
         # title+artist 候補ペアすべてに index を張る
         for t_norm, a_norm in generate_title_artist_pairs(title, artist):

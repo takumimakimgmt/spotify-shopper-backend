@@ -63,7 +63,7 @@ class MatcherTests(unittest.TestCase):
 
         result = mark_owned_tracks(playlist, xml_path)
         track = result["tracks"][0]
-        self.assertTrue(track["owned"])
+        self.assertIsNone(track["owned"])
         self.assertEqual(track["owned_reason"], "fuzzy")
 
     def test_mark_owned_matches_titles_with_underscore_separators(self):
@@ -155,6 +155,10 @@ class MatcherTests(unittest.TestCase):
         }
 
         for track in result["tracks"]:
+            if track["title"] == "Thierry Henry - Modeā Remix":
+                self.assertIsNone(track["owned"])
+                self.assertEqual(track["owned_reason"], "version_mismatch")
+                continue
             if track["title"] == "Somewhere Near Marseilles — マルセイユ辺りー":
                 self.assertFalse(
                     track["owned"],

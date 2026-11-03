@@ -54,7 +54,7 @@ class MatcherTests(unittest.TestCase):
 
         result = mark_owned_tracks(playlist, xml_path)
         track = result["tracks"][0]
-        self.assertTrue(track["owned"])
+        self.assertIsNone(track["owned"])
         self.assertEqual(track["owned_reason"], "fuzzy")
 
     def _get_tmp_dir(self) -> str:

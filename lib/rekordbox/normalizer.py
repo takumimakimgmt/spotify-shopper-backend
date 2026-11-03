@@ -143,3 +143,36 @@ def generate_title_artist_pairs(title: str, artist: str) -> List[Tuple[str, str]
                 pairs.append(key)
 
     return pairs
+
+
+_VERSION_WORDS = re.compile(
+    r"\b(remix|mix|edit|extended|vip|dub|instrumental|acoustic|live|remaster(?:ed)?|version|clean|explicit|part|pt|sped|slowed)\b"
+)
+
+
+def title_version_signature(title: str) -> tuple[str, ...]:
+    """Preserve recording/version labels lost by base-title normalization.
+
+    Brackets, dash separators, underscores and trailing BPM are formatting only.
+    An unlabelled original and Original Mix are equivalent; named remixes,
+    extended cuts and edits remain distinct.
+    """
+    text = _normalize_dash_chars((title or "").casefold()).replace("_", " ")
+    text = _TRAILING_TEMPO_RE.sub("", text)
+    parts = re.findall(r"\(([^)]*)\)|\[([^]]*)\]", text)
+    descriptors = [left or right for left, right in parts]
+    outside = re.sub(r"\([^)]*\)|\[[^]]*\]", "", text)
+    descriptors.extend(re.split(r"\s+-\s+", outside)[1:])
+    signatures = []
+    for descriptor in descriptors:
+        if not _VERSION_WORDS.search(descriptor):
+            continue
+        normalized = re.sub(r"\boriginal\s+mix\b", "", descriptor)
+        normalized = re.sub(r"\bextended\s+mix\b", "extended", normalized)
+        normalized = re.sub(r"\bremastered\b", "remaster", normalized)
+        normalized = re.sub(r"\band\b|&", " ", normalized)
+        normalized = re.sub(r"[^\w\s]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized:
+            signatures.append(normalized)
+    return tuple(sorted(set(signatures)))
