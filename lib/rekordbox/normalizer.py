@@ -114,6 +114,14 @@ def generate_title_artist_pairs(title: str, artist: str) -> List[Tuple[str, str]
 
     if base_title_norm and base_artist_norm:
         pairs.append((base_title_norm, base_artist_norm))
+        import json
+
+        pairs.append(
+            (
+                base_title_norm,
+                "credits:" + json.dumps(artist_identity(artist), ensure_ascii=False),
+            )
+        )
 
     if not base_artist_norm:
         title_tokens = [tok for tok in base_title_norm.split() if tok]
@@ -146,7 +154,7 @@ def generate_title_artist_pairs(title: str, artist: str) -> List[Tuple[str, str]
 
 
 _VERSION_WORDS = re.compile(
-    r"\b(remix|mix|edit|extended|vip|dub|instrumental|acoustic|live|remaster(?:ed)?|version|clean|explicit|part|pt|sped|slowed)\b"
+    r"\b(remix|mix|edit|extended|vip|dub|instrumental|acoustic|live|remaster(?:ed)?|version|clean|explicit|part|pt|sped|slowed|intro|outro|acapella|a cappella)\b"
 )
 
 
@@ -176,3 +184,32 @@ def title_version_signature(title: str) -> tuple[str, ...]:
         if normalized:
             signatures.append(normalized)
     return tuple(sorted(set(signatures)))
+
+
+def artist_identity(name: str) -> tuple[str, ...]:
+    """Keep all credited artists for confirmation, unlike the candidate index."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", name or "").casefold().replace("_", " ")
+    parts = re.split(
+        r"\s*(?:,|&|\band\b|\b(?:feat|ft)\.?(?=\s|$)|\bfeaturing\b)\s*", text
+    )
+    return tuple(
+        sorted({re.sub(r"\s+", " ", part).strip() for part in parts if part.strip()})
+    )
+
+
+def title_annotation_signature(title: str) -> tuple[str, ...]:
+    """Retain semantic parentheses even when no known version word is present."""
+    text = _normalize_dash_chars((title or "").casefold()).replace("_", " ")
+    return tuple(
+        sorted(
+            {
+                re.sub(r"\s+", " ", part).strip()
+                for part in re.findall(r"\(([^)]*)\)", text)
+                if part.strip()
+                and not _VERSION_WORDS.search(part)
+                and not re.match(r"\s*(?:feat\.?|ft\.?|featuring)\s", part)
+            }
+        )
+    )

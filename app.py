@@ -31,7 +31,7 @@ def _env_int(
         return default
 
 
-MAX_UPLOAD_SIZE = _env_int("MAX_UPLOAD_SIZE", 50 * 1024 * 1024)
+MAX_UPLOAD_SIZE = min(_env_int("MAX_UPLOAD_SIZE", 3 * 1024 * 1024), 3 * 1024 * 1024)
 
 import inspect
 from contextlib import asynccontextmanager
@@ -326,8 +326,8 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Allow slightly larger than XML limit to account for multipart overhead (fields + boundaries)
-REQUEST_SIZE_LIMIT_BYTES = _env_int(
-    "REQUEST_SIZE_LIMIT_BYTES", MAX_UPLOAD_SIZE + 5 * 1024 * 1024
+REQUEST_SIZE_LIMIT_BYTES = min(
+    4_400_000, _env_int("REQUEST_SIZE_LIMIT_BYTES", 4_400_000)
 )
 app.add_middleware(RequestSizeLimitMiddleware, max_bytes=REQUEST_SIZE_LIMIT_BYTES)
 app.add_middleware(WorkloadLimitMiddleware)
@@ -652,6 +652,7 @@ async def get_playlist(
         # Merge core-provided meta (e.g., apple_strategy, apple_enrich_skipped)
         core_meta = result.get("meta") or {}
         meta = {
+            **(data.get("meta") or {}),
             "cache_hit": cache_hit,
             "cache_ttl_s": PLAYLIST_CACHE_TTL_S,
             "refresh": 1 if bypass else 0,
@@ -738,7 +739,7 @@ async def match_snapshot_with_xml(
 
     制限：
     - snapshot: 最大 1MB
-    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 50MB）
+    - XML: MAX_UPLOAD_SIZE（環境変数、デフォルト 3MB）
     """
     # サイズチェック（snapshot 文字列長）
     if snapshot is None:
@@ -868,6 +869,7 @@ async def match_snapshot_with_xml(
         original["owned_reason"] = matched_track.get("owned_reason")
         updated_tracks.append(original)
 
+    snap["meta"] = matched.get("meta", {})
     snap["tracks"] = updated_tracks
     # 返却：PlaylistSnapshotV1（入力を更新したもの）
     return snap

@@ -279,8 +279,11 @@ def get_spotify_client() -> spotipy.Spotify:
         auth_manager = SpotifyClientCredentials(
             client_id=client_id,
             client_secret=client_secret,
+            requests_timeout=8,
         )
-        _SPOTIFY_CLIENT = spotipy.Spotify(auth_manager=auth_manager)
+        _SPOTIFY_CLIENT = spotipy.Spotify(
+            auth_manager=auth_manager, requests_timeout=8, retries=0, status_retries=0
+        )
         return _SPOTIFY_CLIENT
 
 
@@ -390,6 +393,11 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     実際に使いやすい dict への変換は playlist_result_to_dict() で行う。
     """
     playlist_id = extract_playlist_id(url_or_id)
+    deadline = time.monotonic() + 20.0
+
+    def check_deadline():
+        if time.monotonic() > deadline:
+            raise TimeoutError("Spotify playlist retrieval exceeded 20s budget")
 
     # Early detection: Check if this is an official editorial playlist (37i9...)
     if re.match(r"^37i9", playlist_id):
@@ -417,10 +425,12 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     # プレイリストメタ情報
     t0_pl = time.perf_counter()
     try:
+        check_deadline()
         playlist = sp.playlist(
             playlist_id,
             fields="id,name,external_urls,owner.id",
         )
+        check_deadline()
         meta["spotify_playlist_ms"] = (time.perf_counter() - t0_pl) * 1000
     except SpotifyException as e:
         status = getattr(e, "http_status", None)
@@ -466,23 +476,31 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     t_tracks0 = time.perf_counter()
     pages = 0
     used_market: str | None = None
+    source_total = None
     for market in markets:
         try:
             used_market = market
             # Fetch only necessary fields to reduce payload size and improve latency
+            check_deadline()
             results = sp.playlist_tracks(
                 playlist_id,
                 limit=100,
                 offset=0,
                 market=market,
-                fields="items(track(id,name,artists(name),external_urls.spotify,is_local,external_ids.isrc,album(name))),next",
+                fields="items(track(id,name,artists(name),external_urls.spotify,is_local,external_ids.isrc,album(name))),next,total",
             )
+            check_deadline()
+            source_total = results.get("total")
             pages += 1
             items.extend(results.get("items", []))
             # paginate
             while results.get("next"):
+                check_deadline()
+                if pages >= 100 or len(items) >= 10000:
+                    raise ValueError("Playlist exceeds retrieval limit (10000 tracks)")
                 try:
                     results = sp.next(results)
+                    check_deadline()
                     pages += 1
                 except SpotifyException as e:
                     status = getattr(e, "http_status", None)
@@ -528,6 +546,9 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
     return {
         "playlist": playlist,
         "items": items,
+        "source_track_count": source_total
+        if isinstance(source_total, int) and source_total >= 0
+        else len(items),
     }
 
 
@@ -618,14 +639,18 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     tracks_out: List[Dict[str, Any]] = []
+    skipped_local = 0
+    skipped_unavailable = 0
 
     for item in items:
         track = item.get("track")
         if not track:
+            skipped_unavailable += 1
             continue
 
         # ローカルトラックはスキップ
         if track.get("is_local"):
+            skipped_local += 1
             continue
 
         # Normalize textual fields (Spotify API always returns correct UTF-8)
@@ -694,6 +719,13 @@ def playlist_result_to_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
         "playlist_name": playlist_name,
         "playlist_url": playlist_url,
         "tracks": tracks_out,
+        "meta": {
+            "source_track_count": raw.get("source_track_count", len(items)),
+            "analyzed_track_count": len(tracks_out),
+            "skipped_track_count": skipped_local + skipped_unavailable,
+            "skipped_local_count": skipped_local,
+            "skipped_unavailable_count": skipped_unavailable,
+        },
     }
 
 
