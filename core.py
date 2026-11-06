@@ -97,6 +97,7 @@ import unicodedata
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from spotipy.exceptions import SpotifyException
+from lib.spotify_errors import SpotifyConfigurationError
 
 # Configure logger for this module
 logger = logging.getLogger(__name__)
@@ -267,7 +268,7 @@ def get_spotify_client() -> spotipy.Spotify:
     client_id = os.getenv("SPOTIFY_CLIENT_ID")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
     if not client_id or not client_secret:
-        raise RuntimeError(
+        raise SpotifyConfigurationError(
             "Spotify client credentials are not set. "
             "Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."
         )

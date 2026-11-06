@@ -5,14 +5,10 @@ import os
 import copy
 import hashlib
 from pathlib import Path
-from dotenv import load_dotenv
+from lib.environment import load_local_environment
+from lib.spotify_errors import spotify_error_details
 
-_ENV = Path(__file__).resolve().parent / ".env"
-_ENV_LOCAL = Path(__file__).resolve().parent / ".env.local"
-if _ENV.exists():
-    load_dotenv(dotenv_path=_ENV, override=True)
-if _ENV_LOCAL.exists():
-    load_dotenv(dotenv_path=_ENV_LOCAL, override=True)
+load_local_environment(Path(__file__).resolve().parent)
 
 
 # Upload size limit (bytes). Used by /api/playlist-with-rekordbox-upload.
@@ -609,6 +605,12 @@ async def get_playlist(
 
         return data
     except Exception as e:
+        spotify_error = spotify_error_details(e)
+        if spotify_error:
+            status, code, headers = spotify_error
+            raise HTTPException(
+                status_code=status, detail={"code": code}, headers=headers
+            ) from None
         # Include Apple-specific meta in error detail for faster diagnosis
         error_meta = getattr(e, "meta", {}) if hasattr(e, "meta") else {}
         if src == "apple" and not error_meta:
