@@ -400,25 +400,6 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
         if time.monotonic() > deadline:
             raise TimeoutError("Spotify playlist retrieval exceeded 20s budget")
 
-    # Early detection: Check if this is an official editorial playlist (37i9...)
-    if re.match(r"^37i9", playlist_id):
-        logger.warning(f"[Spotify] Detected official editorial playlist: {playlist_id}")
-        raise RuntimeError(
-            "このプレイリストはSpotify公式のエディトリアルプレイリスト（ID: 37i9...）です。\n"
-            "公式プレイリストは地域制限があり、取得できない場合があります。\n\n"
-            "解決方法：\n"
-            "1. あなたのアカウントで新しい公開プレイリストを作成\n"
-            "2. このプレイリストの全曲をコピー\n"
-            "3. 新しいプレイリストのURLを使用してください\n\n"
-            "---\n\n"
-            "This is an official Spotify editorial playlist (ID starts with 37i9).\n"
-            "Official playlists may be region-restricted and unavailable via API.\n\n"
-            "Workaround:\n"
-            "1. Create a new public playlist in your Spotify account\n"
-            "2. Copy all tracks from this playlist\n"
-            "3. Use the new playlist URL instead"
-        )
-
     sp = get_spotify_client()
 
     meta: Dict[str, Any] = {}
@@ -542,7 +523,7 @@ def fetch_playlist_tracks(url_or_id: str) -> Dict[str, Any]:
             "You can set SPOTIFY_MARKET (e.g., 'JP' or 'US') to control the market. "
             "Workaround: Create a new public playlist in your account and copy all tracks into it, then use that new playlist URL."
         )
-        raise RuntimeError(prefix + hint)
+        raise RuntimeError(prefix + hint) from last_error
 
     return {
         "playlist": playlist,
